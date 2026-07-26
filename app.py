@@ -12,6 +12,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
+from streamlit_autorefresh import st_autorefresh
 
 import zerodha_client as zc
 
@@ -200,6 +201,69 @@ def build_chart(company: str, closes: pd.Series, ma: pd.Series) -> go.Figure:
     return fig
 
 
+def build_portfolio_pie(df: pd.DataFrame) -> go.Figure:
+    """Build a portfolio allocation pie chart by current value."""
+    top_n = 8
+    pie_df = df[["Symbol", "Current (₹)"]].copy()
+    pie_df = pie_df.sort_values("Current (₹)", ascending=False).reset_index(drop=True)
+    if len(pie_df) > top_n:
+        others_value = float(pie_df.iloc[top_n:]["Current (₹)"].sum())
+        pie_df = pie_df.iloc[:top_n].copy()
+        pie_df.loc[len(pie_df)] = {"Symbol": "Others", "Current (₹)": others_value}
+
+    fig = go.Figure(
+        data=[
+            go.Pie(
+                labels=pie_df["Symbol"],
+                values=pie_df["Current (₹)"],
+                hole=0.45,
+                textinfo="label+percent",
+                textposition="outside",
+                marker=dict(line=dict(color="#0B0F14", width=1)),
+            )
+        ]
+    )
+    fig.update_layout(
+        title=dict(text="Portfolio Allocation (Current Value)", font=dict(size=14)),
+        template="plotly_dark",
+        paper_bgcolor="#0B0F14",
+        plot_bgcolor="#111821",
+        margin=dict(l=20, r=20, t=45, b=20),
+        height=420,
+        font=dict(color="#E8EDF4"),
+        showlegend=True,
+    )
+    return fig
+
+
+def style_holdings_dataframe(df: pd.DataFrame):
+    """Color P&L columns green/red for quick gain-loss visibility."""
+    color_pos = "color: #00D09C; font-weight: 600;"
+    color_neg = "color: #FF6B6B; font-weight: 600;"
+    color_neutral = "color: #9AA6B5;"
+
+    def pnl_style(value: float) -> str:
+        if value > 0:
+            return color_pos
+        if value < 0:
+            return color_neg
+        return color_neutral
+
+    return (
+        df.style.format(
+            {
+                "Avg Cost (₹)": "₹{:,.2f}",
+                "LTP (₹)": "₹{:,.2f}",
+                "Invested (₹)": "₹{:,.2f}",
+                "Current (₹)": "₹{:,.2f}",
+                "P&L (₹)": "₹{:,.2f}",
+                "P&L (%)": "{:+.2f}%",
+            }
+        )
+        .applymap(pnl_style, subset=["P&L (₹)", "P&L (%)"])
+    )
+
+
 def inject_trading_theme() -> None:
     """Apply a Zerodha/Upstox-style dark trading terminal look."""
     st.markdown(
@@ -370,6 +434,12 @@ def inject_trading_theme() -> None:
 
         /* Dataframes / tables */
         [data-testid="stDataFrame"] {
+            border: 1px solid var(--bl-border);
+            border-radius: 10px;
+            overflow: hidden;
+            background: var(--bl-panel);
+        }
+        [data-testid="stTable"] {
             border: 1px solid var(--bl-border);
             border-radius: 10px;
             overflow: hidden;
@@ -666,7 +736,26 @@ def render_holdings_tab() -> None:
 
     st.success(f"Connected as **{st.session_state.get('zerodha_user', 'Zerodha user')}**")
 
-    refresh = st.button("Refresh holdings")
+    st.markdown("### Live refresh controls")
+    refresh_col, interval_col = st.columns([1, 2])
+    with interval_col:
+        refresh_interval = st.radio(
+            "Auto-refresh interval",
+            options=["Off", "15 sec", "30 sec", "60 sec"],
+            horizontal=True,
+            key="holdings_refresh_interval",
+        )
+    with refresh_col:
+        refresh = st.button("Refresh now", use_container_width=True)
+
+    if refresh_interval != "Off":
+        interval_seconds = int(refresh_interval.split()[0])
+        st_autorefresh(
+            interval=interval_seconds * 1000,
+            key=f"holdings_autorefresh_{interval_seconds}",
+        )
+        st.caption(f"Auto-refresh is ON (every {interval_seconds} seconds).")
+
     if refresh or "holdings_df" not in st.session_state:
         try:
             kite = st.session_state["kite"]
@@ -695,7 +784,15 @@ def render_holdings_tab() -> None:
     m3.metric("Current value", f"₹{current:,.2f}")
     m4.metric("Overall P&L", f"₹{pnl:,.2f}", f"{pnl_pct:+.2f}%")
 
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    chart_col, table_col = st.columns([1, 2])
+    with chart_col:
+        st.plotly_chart(build_portfolio_pie(df), use_container_width=True)
+    with table_col:
+        st.dataframe(
+            style_holdings_dataframe(df),
+            use_container_width=True,
+            hide_index=True,
+        )
 
     # Optional: overlay dip signal for holdings that are in Nifty 50
     nifty_symbols = {sym.replace(".NS", "") for sym in NIFTY_50}
