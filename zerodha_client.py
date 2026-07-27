@@ -16,6 +16,17 @@ from kiteconnect.exceptions import KiteException, TokenException
 SESSION_FILE = Path(__file__).resolve().parent / ".kite_session.json"
 
 
+def _format_day_change(day_change_rupees: float | None, day_change_pct: float | None) -> str:
+    """Render holding day change as signed rupees and percent."""
+    if day_change_rupees is None:
+        return "NA"
+    sign = "+" if day_change_rupees >= 0 else "-"
+    rupees_text = f"{sign}₹{abs(day_change_rupees):,.2f}"
+    if day_change_pct is None:
+        return rupees_text
+    return f"{rupees_text} ({day_change_pct:+.2f}%)"
+
+
 def extract_request_token(value: str) -> str | None:
     """Pull request_token from a raw token or a full redirect URL."""
     text = (value or "").strip()
@@ -121,6 +132,7 @@ def holdings_to_dataframe(holdings: list[dict[str, Any]]):
                 "Symbol",
                 "Exchange",
                 "Qty",
+                "Day changed",
                 "Avg Cost (₹)",
                 "LTP (₹)",
                 "Invested (₹)",
@@ -135,6 +147,13 @@ def holdings_to_dataframe(holdings: list[dict[str, Any]]):
         qty = float(h.get("quantity", 0) or 0) + float(h.get("t1_quantity", 0) or 0)
         avg = float(h.get("average_price", 0) or 0)
         ltp = float(h.get("last_price", 0) or 0)
+        day_change = float(h.get("day_change", 0) or 0)
+        raw_day_change_pct = h.get("day_change_percentage")
+        day_change_pct = (
+            float(raw_day_change_pct)
+            if raw_day_change_pct not in (None, "")
+            else None
+        )
         invested = qty * avg
         current = qty * ltp
         pnl = float(h.get("pnl", current - invested) or (current - invested))
@@ -144,6 +163,7 @@ def holdings_to_dataframe(holdings: list[dict[str, Any]]):
                 "Symbol": h.get("tradingsymbol", ""),
                 "Exchange": h.get("exchange", ""),
                 "Qty": int(qty) if qty == int(qty) else qty,
+                "Day changed": _format_day_change(round(day_change, 2), day_change_pct),
                 "Avg Cost (₹)": round(avg, 2),
                 "LTP (₹)": round(ltp, 2),
                 "Invested (₹)": round(invested, 2),

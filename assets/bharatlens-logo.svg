@@ -1,0 +1,23 @@
+<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bgGrad" x1="22" y1="18" x2="230" y2="240" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#387ED1"/>
+      <stop offset="1" stop-color="#244F84"/>
+    </linearGradient>
+    <linearGradient id="upGrad" x1="70" y1="176" x2="182" y2="70" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7BE7CB"/>
+      <stop offset="1" stop-color="#00B386"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(128 98) rotate(90) scale(120 130)">
+      <stop stop-color="#66AFFF" stop-opacity="0.36"/>
+      <stop offset="1" stop-color="#66AFFF" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect x="16" y="16" width="224" height="224" rx="56" fill="url(#bgGrad)"/>
+  <rect x="30" y="30" width="196" height="196" rx="42" fill="#0D1623" fill-opacity="0.32"/>
+  <circle cx="128" cy="128" r="108" fill="url(#glow)"/>
+  <path d="M66 160L101 124L126 143L186 84" stroke="url(#upGrad)" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="186" cy="84" r="12" fill="#7BE7CB"/>
+  <path d="M66 186H188" stroke="#AFC9EA" stroke-opacity="0.72" stroke-width="11" stroke-linecap="round"/>
+  <path d="M74 66H112" stroke="#76B6FF" stroke-opacity="0.42" stroke-width="9" stroke-linecap="round"/>
+</svg>
