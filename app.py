@@ -1202,7 +1202,8 @@ def fetch_stock_context(ticker: str) -> dict[str, Any]:
     current_volume = None
     if not hist.empty and "Volume" in hist.columns and "Close" in hist.columns:
         vol = pd.to_numeric(hist["Volume"], errors="coerce").fillna(0.0)
-        close = pd.to_numeric(hist["Close"], errors="coerce").dropna()
+        close = pd.to_numeric(hist["Close"], errors="coerce")
+        close_valid = close.dropna()
         if len(vol) >= 1:
             current_volume = float(vol.iloc[-1])
         if len(vol) >= 5:
@@ -1212,11 +1213,13 @@ def fetch_stock_context(ticker: str) -> dict[str, Any]:
             base_vol = float(vol.tail(25).head(20).mean())
             if base_vol > 0:
                 volume_ratio = recent_vol / base_vol
-        if len(close) >= 6:
-            up_mask = close.diff().fillna(0) > 0
-            down_mask = close.diff().fillna(0) < 0
-            up_vol = float(vol[up_mask].tail(10).sum())
-            down_vol = float(vol[down_mask].tail(10).sum())
+        if len(close_valid) >= 6:
+            price_diff = close.diff()
+            valid_mask = close.notna()
+            up_mask = (price_diff > 0) & valid_mask
+            down_mask = (price_diff < 0) & valid_mask
+            up_vol = float(vol.loc[up_mask].tail(10).sum())
+            down_vol = float(vol.loc[down_mask].tail(10).sum())
             if down_vol > 0:
                 up_down_volume_ratio = up_vol / down_vol
 
@@ -1577,8 +1580,16 @@ def analyse_stock(
         target_1 = None
         target_2 = None
         swing_grade = "NA"
-    rr_target_1 = _format_rr(price, stop_loss, target_1) if stop_loss is not None and target_1 is not None else None
-    rr_target_2 = _format_rr(price, stop_loss, target_2) if stop_loss is not None and target_2 is not None else None
+    rr_target_1 = (
+        _format_rr(entry_low, stop_loss, target_1)
+        if entry_low is not None and stop_loss is not None and target_1 is not None
+        else None
+    )
+    rr_target_2 = (
+        _format_rr(entry_low, stop_loss, target_2)
+        if entry_low is not None and stop_loss is not None and target_2 is not None
+        else None
+    )
 
     return {
         "Symbol": ticker.replace(".NS", ""),
