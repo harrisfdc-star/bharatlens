@@ -7,6 +7,8 @@ from __future__ import annotations
 import base64
 import datetime as dt
 import io
+import json
+import os
 from pathlib import Path
 import re
 from typing import Any
@@ -85,6 +87,25 @@ MA_WINDOW = 50
 LOOKBACK_DAYS = 380
 MAX_STOCK_PRICE = 1200.0
 
+MODEL_STATE_PATH = Path(__file__).resolve().parent / "model_feedback_state.json"
+TRADE_JOURNAL_PATH = Path(__file__).resolve().parent / "paper_trade_journal.json"
+DEFAULT_COMPONENT_WEIGHTS: dict[str, float] = {
+    "technical": 1.0,
+    "fundamental": 1.0,
+    "flow": 1.0,
+    "resilience": 1.0,
+}
+COMPONENT_SCORE_SCALE: dict[str, float] = {
+    "technical": 44.0,
+    "fundamental": 32.0,
+    "flow": 23.0,
+    "resilience": 11.0,
+}
+MIN_COMPONENT_WEIGHT = 0.65
+MAX_COMPONENT_WEIGHT = 1.55
+LEARNING_RATE = 0.05
+REGIME_BUCKETS = ("Bullish", "Bearish", "Sideways")
+
 POSITIVE_SENTIMENT_TERMS = {
     "beat",
     "growth",
@@ -160,6 +181,124 @@ def _format_since_added_change(current_price: Any, baseline_price: Any) -> str:
     return _format_day_change(delta_rupees, delta_pct)
 
 
+def _extract_min_days(window_text: Any) -> int | None:
+    """Extract first day value from a window string like '5-10'."""
+    text = str(window_text or "").strip()
+    if not text or text.upper() == "NA":
+        return None
+    match = re.search(r"\d+", text)
+    if not match:
+        return None
+    try:
+        return int(match.group(0))
+    except Exception:
+        return None
+
+
+def _parse_day_window(window_text: Any) -> tuple[int | None, int | None]:
+    """Parse a day-window string like '5-10' into (start, end)."""
+    text = str(window_text or "").strip()
+    if not text or text.upper() == "NA":
+        return (None, None)
+    nums = [int(x) for x in re.findall(r"\d+", text)]
+    if not nums:
+        return (None, None)
+    if len(nums) == 1:
+        return (nums[0], nums[0])
+    start, end = nums[0], nums[1]
+    if start > end:
+        start, end = end, start
+    return (start, end)
+
+
+def _window_overlaps(window_text: Any, start_day: int, end_day: int) -> bool:
+    """Return True if parsed day window overlaps [start_day, end_day]."""
+    w_start, w_end = _parse_day_window(window_text)
+    if w_start is None or w_end is None:
+        return False
+    return not (w_end < start_day or w_start > end_day)
+
+
+def _clean_text(value: Any) -> str | None:
+    """Return stripped non-empty text, otherwise None."""
+    text = str(value or "").strip()
+    return text if text else None
+
+
+def _calc_exit_gain_pct(entry_price: Any, exit_price: Any) -> float | None:
+    """Calculate percentage gain from entry to exit."""
+    entry = _to_float(entry_price)
+    exit_val = _to_float(exit_price)
+    if entry is None or exit_val is None or entry <= 0:
+        return None
+    return round(((exit_val - entry) / entry) * 100.0, 2)
+
+
+def _format_exit_with_gain(entry_price: Any, exit_price: Any) -> str:
+    """Format proposed exit as value and gain in brackets."""
+    exit_val = _to_float(exit_price)
+    if exit_val is None:
+        return "NA"
+    gain_pct = _calc_exit_gain_pct(entry_price, exit_val)
+    if gain_pct is None:
+        return f"₹{exit_val:,.2f}"
+    return f"₹{exit_val:,.2f} ({gain_pct:+.2f}%)"
+
+
+def _high_conviction_gate(row: dict[str, Any]) -> tuple[bool, list[str]]:
+    """Evaluate stricter 10% target gate for BUY/BUY ON DIP setups."""
+    rec = str(row.get("Recommendation", "")).upper().strip()
+    if rec not in {"BUY", "BUY ON DIP"}:
+        return False, ["not-buy-signal"]
+
+    failures: list[str] = []
+    confidence = _to_float(row.get("Confidence (1-10)")) or 0.0
+    promoter = _to_float(row.get("Promoter / Insider Stake (%)")) or 0.0
+    cmp_value = _to_float(row.get("CMP (₹)")) or 0.0
+    entry_price = _to_float(row.get("Entry Price (₹)")) or cmp_value
+    exit_price = _to_float(row.get("Proposed Exit Price (₹)"))
+    target_2 = _to_float(row.get("Target 2 (₹)"))
+    weekly_momentum = _to_float(row.get("Weekly Momentum (%)")) or 0.0
+    volume_surge = _to_float(row.get("Volume Surge (5d/20d)")) or 0.0
+    buy_sell_ratio = _to_float(row.get("Buy/Sell Volume Ratio"))
+    day_change = _to_float(row.get("Daily Change (%)"))
+    sentiment_score = _to_float(row.get("Product Sentiment Score")) or 0.0
+    earnings_days = _to_float(row.get("Results Announcement (days)"))
+    sell_window = row.get("Sell Window (next 2w, days)")
+    time_stop_days = _to_float(row.get("Time Stop (days)"))
+
+    target_ref = target_2 if target_2 is not None else exit_price
+    upside_pct = (((target_ref / entry_price) - 1.0) * 100.0) if target_ref and entry_price > 0 else None
+    holding_ok = _window_overlaps(sell_window, 5, 10) or (
+        time_stop_days is not None and 5 <= time_stop_days <= 10
+    )
+
+    if confidence < 8.0:
+        failures.append("confidence<8")
+    if promoter < 40.0:
+        failures.append("promoter<40")
+    if upside_pct is None or upside_pct < 10.0:
+        failures.append("upside<10%")
+    if not holding_ok:
+        failures.append("hold-window-mismatch")
+    if weekly_momentum < 0.8:
+        failures.append("weak-momentum")
+    if volume_surge < 1.05:
+        failures.append("weak-volume")
+    if buy_sell_ratio is not None and buy_sell_ratio < 1.0:
+        failures.append("sell-dominant-flow")
+    if sentiment_score < 0:
+        failures.append("negative-sentiment")
+    if day_change is not None and day_change > 6.0:
+        failures.append("overextended-day-move")
+    if earnings_days is not None and earnings_days < 2:
+        failures.append("near-results-risk")
+
+    if failures:
+        return False, failures
+    return True, []
+
+
 def _track_since_added_change(store_key: str, symbol: Any, current_price: Any) -> str:
     """Store first-seen price and return change from that baseline."""
     symbol_key = str(symbol or "").strip()
@@ -179,9 +318,24 @@ def _track_since_added_change(store_key: str, symbol: Any, current_price: Any) -
         existing = baseline_store[symbol_key]
 
     baseline_price = existing.get("price")
-    baseline_date = existing.get("date", "Unknown")
     change_text = _format_since_added_change(current_val, baseline_price)
-    return f"{change_text} | {baseline_date}"
+    return change_text
+
+
+def _get_since_added_date(store_key: str, symbol: Any) -> str:
+    """Return first-seen date for a symbol from baseline store."""
+    symbol_key = str(symbol or "").strip()
+    if not symbol_key:
+        return "NA"
+
+    baseline_store = st.session_state.get(store_key, {})
+    existing = baseline_store.get(symbol_key)
+    if isinstance(existing, dict):
+        added_on = str(existing.get("date", "") or "").strip()
+        return added_on if added_on else "Unknown"
+    if existing is not None:
+        return "Unknown"
+    return "NA"
 
 
 def _confidence_value(row: dict[str, Any]) -> float:
@@ -190,6 +344,301 @@ def _confidence_value(row: dict[str, Any]) -> float:
     if value is None or pd.isna(value):
         return float("-inf")
     return float(value)
+
+
+def _load_model_state() -> dict[str, Any]:
+    """Load persisted adaptive weights + feedback history."""
+    default_weights_by_regime = {
+        regime: dict(DEFAULT_COMPONENT_WEIGHTS) for regime in REGIME_BUCKETS
+    }
+    default_state: dict[str, Any] = {
+        "weights": dict(DEFAULT_COMPONENT_WEIGHTS),
+        "weights_by_regime": default_weights_by_regime,
+        "history": {},
+        "metrics": {
+            "feedback_updates": 0,
+            "avg_return_ewma": 0.0,
+            "last_feedback_date": "",
+        },
+    }
+    if not MODEL_STATE_PATH.exists():
+        return default_state
+
+    try:
+        loaded = json.loads(MODEL_STATE_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return default_state
+
+    state = default_state
+    if isinstance(loaded, dict):
+        legacy_weights: dict[str, float] = {}
+        if isinstance(loaded.get("weights"), dict):
+            for k, v in loaded["weights"].items():
+                if k in DEFAULT_COMPONENT_WEIGHTS and isinstance(v, (int, float)):
+                    clipped = float(
+                        np.clip(v, MIN_COMPONENT_WEIGHT, MAX_COMPONENT_WEIGHT)
+                    )
+                    state["weights"][k] = clipped
+                    legacy_weights[k] = clipped
+        if isinstance(loaded.get("weights_by_regime"), dict):
+            for regime, weight_map in loaded["weights_by_regime"].items():
+                if regime not in REGIME_BUCKETS or not isinstance(weight_map, dict):
+                    continue
+                for k, v in weight_map.items():
+                    if k in DEFAULT_COMPONENT_WEIGHTS and isinstance(v, (int, float)):
+                        state["weights_by_regime"][regime][k] = float(
+                            np.clip(v, MIN_COMPONENT_WEIGHT, MAX_COMPONENT_WEIGHT)
+                        )
+        elif legacy_weights:
+            # Migrate old global weights into every regime bucket.
+            for regime in REGIME_BUCKETS:
+                state["weights_by_regime"][regime].update(legacy_weights)
+        if isinstance(loaded.get("history"), dict):
+            state["history"] = loaded["history"]
+        if isinstance(loaded.get("metrics"), dict):
+            state["metrics"].update(loaded["metrics"])
+    return state
+
+
+def _save_model_state(state: dict[str, Any]) -> None:
+    """Persist adaptive model state to local JSON."""
+    try:
+        MODEL_STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    except OSError:
+        # Non-blocking: scanning should continue even if state cannot be saved.
+        return
+
+
+def _get_regime_weights(state: dict[str, Any], regime: str) -> dict[str, float]:
+    """Get sanitized adaptive weights for the active regime."""
+    safe_regime = regime if regime in REGIME_BUCKETS else "Sideways"
+    weights_by_regime = state.setdefault(
+        "weights_by_regime",
+        {name: dict(DEFAULT_COMPONENT_WEIGHTS) for name in REGIME_BUCKETS},
+    )
+    regime_weights = weights_by_regime.setdefault(safe_regime, dict(DEFAULT_COMPONENT_WEIGHTS))
+    return {
+        name: float(
+            np.clip(
+                regime_weights.get(name, DEFAULT_COMPONENT_WEIGHTS[name]),
+                MIN_COMPONENT_WEIGHT,
+                MAX_COMPONENT_WEIGHT,
+            )
+        )
+        for name in DEFAULT_COMPONENT_WEIGHTS
+    }
+
+
+def _load_trade_journal() -> list[dict[str, Any]]:
+    """Load persisted paper-trade journal rows."""
+    if not TRADE_JOURNAL_PATH.exists():
+        return []
+    try:
+        rows = json.loads(TRADE_JOURNAL_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+    if not isinstance(rows, list):
+        return []
+    clean_rows: list[dict[str, Any]] = []
+    for row in rows:
+        if isinstance(row, dict):
+            clean_rows.append(row)
+    return clean_rows
+
+
+def _save_trade_journal(rows: list[dict[str, Any]]) -> None:
+    """Persist paper-trade journal rows."""
+    try:
+        TRADE_JOURNAL_PATH.write_text(json.dumps(rows, indent=2), encoding="utf-8")
+    except OSError:
+        return
+
+
+def _upsert_journal_in_session(rows: list[dict[str, Any]]) -> None:
+    """Update in-memory + file-backed journal state."""
+    st.session_state["paper_trade_journal_rows"] = rows
+    _save_trade_journal(rows)
+
+
+def _format_rr(entry: Any, stop: Any, target: Any) -> float | None:
+    """Return risk-reward ratio for one target."""
+    try:
+        entry_v = float(entry)
+        stop_v = float(stop)
+        target_v = float(target)
+    except (TypeError, ValueError):
+        return None
+    risk = entry_v - stop_v
+    if risk <= 0:
+        return None
+    reward = target_v - entry_v
+    return round(reward / risk, 2)
+
+
+def _trade_card_score_tag(row: dict[str, Any]) -> tuple[int, str, str]:
+    """Compute quick decision score and tag for trade card."""
+    rec = str(row.get("Recommendation", "") or "").upper().strip()
+    confidence = float(row.get("Confidence (1-10)", 0.0) or 0.0)
+    rr_t1 = _to_float(row.get("RR to T1"))
+    rr_t2 = _to_float(row.get("RR to T2"))
+    mom_5 = _to_float(row.get("_mom_5m"))
+    mom_15 = _to_float(row.get("_mom_15m"))
+    earnings_days = row.get("Results Announcement (days)")
+    try:
+        earnings_days_num = int(earnings_days) if earnings_days is not None else None
+    except Exception:
+        earnings_days_num = None
+
+    score = 38
+    if rec in {"BUY", "BUY ON DIP"}:
+        score += 20
+    elif rec == "WATCH":
+        score += 10
+    else:
+        score -= 18
+
+    if confidence >= 8.0:
+        score += 16
+    elif confidence >= 7.0:
+        score += 11
+    elif confidence >= 6.5:
+        score += 7
+    else:
+        score += 2
+
+    if rr_t1 is not None:
+        if rr_t1 >= 2.0:
+            score += 12
+        elif rr_t1 >= 1.6:
+            score += 8
+        elif rr_t1 >= 1.2:
+            score += 4
+    if rr_t2 is not None:
+        if rr_t2 >= 2.5:
+            score += 10
+        elif rr_t2 >= 2.0:
+            score += 7
+        elif rr_t2 >= 1.5:
+            score += 4
+
+    if mom_5 is not None:
+        if mom_5 >= 0.35:
+            score += 6
+        elif mom_5 >= 0:
+            score += 3
+        elif mom_5 <= -0.4:
+            score -= 5
+    if mom_15 is not None:
+        if mom_15 >= 0.45:
+            score += 8
+        elif mom_15 >= 0:
+            score += 4
+        elif mom_15 <= -0.5:
+            score -= 7
+
+    if earnings_days_num is not None:
+        if earnings_days_num < 2:
+            score -= 6
+        elif earnings_days_num <= 10:
+            score += 2
+        else:
+            score += 4
+
+    score = int(np.clip(score, 0, 100))
+    if (
+        score >= 75
+        and rec in {"BUY", "BUY ON DIP"}
+        and (rr_t1 is None or rr_t1 >= 1.6)
+        and (mom_15 is None or mom_15 >= -0.15)
+    ):
+        return score, "Ready", "#00B386"
+    if score >= 55:
+        return score, "Watch", "#FFB020"
+    return score, "Skip", "#EB5336"
+
+
+def _get_optional_config(key: str) -> str:
+    """Read optional config from env or Streamlit secrets."""
+    raw = os.getenv(key)
+    if raw:
+        return str(raw).strip()
+    try:
+        if key in st.secrets:
+            return str(st.secrets[key]).strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def _learn_from_row_feedback(
+    state: dict[str, Any], row: dict[str, Any], scan_date: str, current_regime: str
+) -> float | None:
+    """Update adaptive weights from realized movement since previous scan."""
+    symbol = str(row.get("Symbol") or "").strip()
+    current_price = row.get("CMP (₹)")
+    if not symbol or current_price is None or pd.isna(current_price):
+        return None
+
+    weights_by_regime = state.setdefault(
+        "weights_by_regime",
+        {name: dict(DEFAULT_COMPONENT_WEIGHTS) for name in REGIME_BUCKETS},
+    )
+    history = state.setdefault("history", {})
+    metrics = state.setdefault("metrics", {})
+    previous = history.get(symbol, {})
+    realized_return_pct: float | None = None
+
+    prev_date = str(previous.get("date") or "")
+    prev_price_raw = previous.get("price")
+    prev_components = previous.get("components", {})
+    prev_regime = str(previous.get("regime") or "Sideways")
+    prev_regime = prev_regime if prev_regime in REGIME_BUCKETS else "Sideways"
+
+    if prev_date and prev_date != scan_date and prev_price_raw not in (None, ""):
+        prev_price = float(prev_price_raw)
+        if prev_price > 0:
+            realized_return_pct = ((float(current_price) / prev_price) - 1.0) * 100.0
+            return_signal = float(np.clip(realized_return_pct / 3.0, -1.5, 1.5))
+            regime_weights = weights_by_regime.setdefault(
+                prev_regime, dict(DEFAULT_COMPONENT_WEIGHTS)
+            )
+            for name in DEFAULT_COMPONENT_WEIGHTS:
+                base_weight = float(
+                    np.clip(
+                        regime_weights.get(name, DEFAULT_COMPONENT_WEIGHTS[name]),
+                        MIN_COMPONENT_WEIGHT,
+                        MAX_COMPONENT_WEIGHT,
+                    )
+                )
+                component_score = float(prev_components.get(name, 0.0) or 0.0)
+                scale = float(COMPONENT_SCORE_SCALE.get(name, 1.0))
+                strength = float(np.clip((component_score / scale) - 0.5, -0.5, 0.5))
+                adjustment = LEARNING_RATE * strength * return_signal
+                regime_weights[name] = float(
+                    np.clip(
+                        base_weight * (1.0 + adjustment),
+                        MIN_COMPONENT_WEIGHT,
+                        MAX_COMPONENT_WEIGHT,
+                    )
+                )
+
+            prev_ewma = float(metrics.get("avg_return_ewma", 0.0) or 0.0)
+            metrics["avg_return_ewma"] = round((0.88 * prev_ewma) + (0.12 * realized_return_pct), 4)
+            metrics["feedback_updates"] = int(metrics.get("feedback_updates", 0) or 0) + 1
+            metrics["last_feedback_date"] = scan_date
+
+    history[symbol] = {
+        "date": scan_date,
+        "price": round(float(current_price), 4),
+        "components": {
+            name: round(float((row.get("_component_scores", {}) or {}).get(name, 0.0) or 0.0), 4)
+            for name in DEFAULT_COMPONENT_WEIGHTS
+        },
+        "signal": str(row.get("Recommendation", "")),
+        "confidence": float(row.get("Confidence (1-10)", 0.0) or 0.0),
+        "regime": current_regime if current_regime in REGIME_BUCKETS else "Sideways",
+    }
+    return realized_return_pct
 
 
 def _extract_close(raw: pd.DataFrame, ticker: str) -> pd.Series | None:
@@ -221,33 +670,178 @@ def _extract_close(raw: pd.DataFrame, ticker: str) -> pd.Series | None:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_market_data(tickers: tuple[str, ...]) -> dict[str, pd.Series]:
-    """Download recent daily closes for all tickers (cached for 1 hour)."""
+def fetch_market_data(
+    tickers: tuple[str, ...],
+    lookback_days: int = LOOKBACK_DAYS,
+    chunk_size: int = 120,
+) -> dict[str, pd.Series]:
+    """Download recent daily closes for tickers in safe chunks."""
     end = dt.date.today() + dt.timedelta(days=1)
-    start = end - dt.timedelta(days=LOOKBACK_DAYS)
-
-    raw = yf.download(
-        list(tickers),
-        start=start.isoformat(),
-        end=end.isoformat(),
-        auto_adjust=True,
-        progress=False,
-        threads=True,
-        group_by="ticker",
-    )
+    start = end - dt.timedelta(days=max(80, int(lookback_days)))
 
     result: dict[str, pd.Series] = {}
-    for ticker in tickers:
+    ticker_list = list(tickers)
+    for start_idx in range(0, len(ticker_list), max(20, int(chunk_size))):
+        batch = ticker_list[start_idx : start_idx + max(20, int(chunk_size))]
         try:
-            if isinstance(raw.columns, pd.MultiIndex) and ticker in raw.columns.get_level_values(0):
-                close = _extract_close(raw[ticker], ticker)
-            else:
-                close = _extract_close(raw, ticker)
-            if close is not None:
-                result[ticker] = close
+            raw = yf.download(
+                batch,
+                start=start.isoformat(),
+                end=end.isoformat(),
+                auto_adjust=True,
+                progress=False,
+                threads=True,
+                group_by="ticker",
+            )
         except Exception:
             continue
+
+        for ticker in batch:
+            try:
+                if isinstance(raw.columns, pd.MultiIndex) and ticker in raw.columns.get_level_values(0):
+                    close = _extract_close(raw[ticker], ticker)
+                else:
+                    close = _extract_close(raw, ticker)
+                if close is not None:
+                    result[ticker] = close
+            except Exception:
+                continue
     return result
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_nse_equity_universe() -> dict[str, str]:
+    """Fetch broad NSE listed equities universe from official CSV."""
+    url = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
+    try:
+        df = pd.read_csv(url)
+    except Exception:
+        return dict(NIFTY_50)
+
+    if "SYMBOL" not in df.columns:
+        return dict(NIFTY_50)
+
+    series_col = " SERIES" if " SERIES" in df.columns else "SERIES"
+    name_col = "NAME OF COMPANY" if "NAME OF COMPANY" in df.columns else None
+
+    if series_col in df.columns:
+        df = df[df[series_col].astype(str).str.strip().isin({"EQ", "BE"})]
+
+    out: dict[str, str] = {}
+    for _, row in df.iterrows():
+        sym = str(row.get("SYMBOL", "") or "").strip().upper()
+        if not sym:
+            continue
+        name = str(row.get(name_col, sym) if name_col else sym).strip()
+        out[f"{sym}.NS"] = name or sym
+    return out or dict(NIFTY_50)
+
+
+def _parse_custom_symbols(raw_text: str) -> list[str]:
+    """Parse comma/newline separated custom symbols into Yahoo format."""
+    parsed: list[str] = []
+    for token in re.split(r"[\s,;|]+", str(raw_text or "")):
+        clean = token.strip().upper()
+        if not clean:
+            continue
+        if clean.endswith(".NS") or clean.endswith(".BO"):
+            parsed.append(clean)
+        elif clean.isalnum():
+            # Default to NSE if suffix not provided.
+            parsed.append(f"{clean}.NS")
+    # Preserve order, remove duplicates.
+    return list(dict.fromkeys(parsed))
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def fetch_intraday_momentum_map(
+    tickers: tuple[str, ...],
+    interval: str = "5m",
+    chunk_size: int = 80,
+) -> dict[str, float]:
+    """Return latest intraday momentum percentage map."""
+    out: dict[str, float] = {}
+    ticker_list = list(tickers)
+    for start_idx in range(0, len(ticker_list), max(20, int(chunk_size))):
+        batch = ticker_list[start_idx : start_idx + max(20, int(chunk_size))]
+        try:
+            raw = yf.download(
+                batch,
+                period="1d",
+                interval=interval,
+                auto_adjust=True,
+                progress=False,
+                threads=True,
+                group_by="ticker",
+            )
+        except Exception:
+            continue
+
+        for ticker in batch:
+            try:
+                if isinstance(raw.columns, pd.MultiIndex) and ticker in raw.columns.get_level_values(0):
+                    close = pd.to_numeric(raw[ticker].get("Close"), errors="coerce").dropna()
+                else:
+                    close = pd.to_numeric(raw.get("Close"), errors="coerce").dropna()
+                if close is None or len(close) < 2:
+                    continue
+                prev = float(close.iloc[-2])
+                last = float(close.iloc[-1])
+                if prev:
+                    out[ticker] = round(((last / prev) - 1.0) * 100.0, 2)
+            except Exception:
+                continue
+    return out
+
+
+@st.cache_data(ttl=45, show_spinner=False)
+def fetch_live_price_snapshot(ticker: str) -> dict[str, float] | None:
+    """Fetch latest close-style price and day-change for one symbol."""
+    try:
+        hist = yf.Ticker(ticker).history(period="5d", interval="1d", auto_adjust=True)
+        if hist is None or hist.empty or "Close" not in hist.columns:
+            return None
+        closes = pd.to_numeric(hist["Close"], errors="coerce").dropna()
+        if len(closes) < 2:
+            return None
+        latest = float(closes.iloc[-1])
+        prev = float(closes.iloc[-2])
+        day_change = latest - prev
+        day_change_pct = ((latest / prev) - 1.0) * 100.0 if prev else 0.0
+        return {
+            "price": round(latest, 2),
+            "day_change": round(day_change, 2),
+            "day_change_pct": round(day_change_pct, 2),
+        }
+    except Exception:
+        return None
+
+
+def _refresh_rows_with_live_prices(
+    rows: list[dict[str, Any]],
+    store_key: str,
+    max_rows: int = 20,
+) -> None:
+    """Update CMP/day-change for visible rows and refresh since-added fields."""
+    for row in rows[:max_rows]:
+        symbol = str(row.get("Symbol", "") or "").strip()
+        if not symbol:
+            continue
+
+        snapshot = fetch_live_price_snapshot(f"{symbol}.NS")
+        if snapshot:
+            latest_price = float(snapshot["price"])
+            row["CMP (₹)"] = latest_price
+            row["Price (₹)"] = latest_price
+            row["Day changed"] = float(snapshot["day_change"])
+            row["Daily Change (%)"] = float(snapshot["day_change_pct"])
+
+        row["_since_added"] = _track_since_added_change(
+            store_key,
+            symbol,
+            row.get("CMP (₹)"),
+        )
+        row["_added_on"] = _get_since_added_date(store_key, symbol)
 
 
 def _to_float(value: Any) -> float | None:
@@ -398,6 +992,73 @@ def _compute_rsi(closes: pd.Series, period: int = 14) -> float | None:
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
+def fetch_alpha_vantage_market_sentiment() -> dict[str, Any]:
+    """Optional: broad market sentiment from Alpha Vantage news feed."""
+    api_key = _get_optional_config("ALPHAVANTAGE_API_KEY")
+    if not api_key:
+        return {
+            "enabled": False,
+            "source": "Alpha Vantage",
+            "score": 0.0,
+            "label": "Neutral",
+            "sample_size": 0,
+        }
+
+    params = urllib.parse.urlencode(
+        {
+            "function": "NEWS_SENTIMENT",
+            "topics": "financial_markets",
+            "sort": "LATEST",
+            "limit": "50",
+            "apikey": api_key,
+        }
+    )
+    url = f"https://www.alphavantage.co/query?{params}"
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        feed = payload.get("feed", []) if isinstance(payload, dict) else []
+        scores: list[float] = []
+        for item in feed:
+            raw = item.get("overall_sentiment_score")
+            if raw in (None, ""):
+                continue
+            try:
+                scores.append(float(raw))
+            except (TypeError, ValueError):
+                continue
+
+        if not scores:
+            return {
+                "enabled": True,
+                "source": "Alpha Vantage",
+                "score": 0.0,
+                "label": "Neutral",
+                "sample_size": 0,
+            }
+
+        sentiment = float(np.clip(np.mean(scores), -1.0, 1.0))
+        return {
+            "enabled": True,
+            "source": "Alpha Vantage",
+            "score": sentiment,
+            "label": _label_from_sentiment(sentiment),
+            "sample_size": len(scores),
+        }
+    except Exception:
+        return {
+            "enabled": True,
+            "source": "Alpha Vantage",
+            "score": 0.0,
+            "label": "Neutral",
+            "sample_size": 0,
+        }
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
 def fetch_market_pulse() -> dict[str, Any]:
     """Get broad market trend from NIFTY index."""
     end = dt.date.today() + dt.timedelta(days=1)
@@ -412,12 +1073,18 @@ def fetch_market_pulse() -> dict[str, Any]:
         threads=False,
     )
     closes = _extract_close(raw, "^NSEI")
+    av_sentiment = fetch_alpha_vantage_market_sentiment()
+    av_score = float(av_sentiment.get("score", 0.0) or 0.0) if av_sentiment.get("enabled") else 0.0
     if closes is None or len(closes) < MA_WINDOW:
         return {
             "name": "NIFTY 50",
             "regime": "Sideways",
             "weekly_pct": 0.0,
             "score_boost": 0.0,
+            "ext_sentiment_source": av_sentiment.get("source", "Alpha Vantage"),
+            "ext_sentiment_label": av_sentiment.get("label", "Neutral"),
+            "ext_sentiment_score": round(av_score, 3),
+            "ext_sentiment_samples": int(av_sentiment.get("sample_size", 0) or 0),
         }
 
     price = float(closes.iloc[-1])
@@ -434,11 +1101,23 @@ def fetch_market_pulse() -> dict[str, Any]:
         regime = "Sideways"
         boost = 0.0
 
+    # Blend optional external sentiment API into market pulse.
+    boost += float(np.clip(av_score * 0.12, -0.12, 0.12))
+    if regime == "Sideways":
+        if av_score >= 0.35 and weekly_pct >= -0.4 and price >= ma50 * 0.995:
+            regime = "Bullish"
+        elif av_score <= -0.35 and weekly_pct <= 0.4 and price <= ma50 * 1.005:
+            regime = "Bearish"
+
     return {
         "name": "NIFTY 50",
         "regime": regime,
         "weekly_pct": round(weekly_pct, 2),
-        "score_boost": boost,
+        "score_boost": round(boost, 4),
+        "ext_sentiment_source": av_sentiment.get("source", "Alpha Vantage"),
+        "ext_sentiment_label": av_sentiment.get("label", "Neutral"),
+        "ext_sentiment_score": round(av_score, 3),
+        "ext_sentiment_samples": int(av_sentiment.get("sample_size", 0) or 0),
     }
 
 
@@ -520,9 +1199,12 @@ def fetch_stock_context(ticker: str) -> dict[str, Any]:
     volume_ratio = None
     up_down_volume_ratio = None
     avg_volume_5d = None
+    current_volume = None
     if not hist.empty and "Volume" in hist.columns and "Close" in hist.columns:
         vol = pd.to_numeric(hist["Volume"], errors="coerce").fillna(0.0)
         close = pd.to_numeric(hist["Close"], errors="coerce").dropna()
+        if len(vol) >= 1:
+            current_volume = float(vol.iloc[-1])
         if len(vol) >= 5:
             avg_volume_5d = float(vol.tail(5).mean())
         if len(vol) >= 25:
@@ -551,6 +1233,8 @@ def fetch_stock_context(ticker: str) -> dict[str, Any]:
     promoter_stake = _to_float(info.get("heldPercentInsiders"))
     if promoter_stake is not None and promoter_stake <= 1.0:
         promoter_stake *= 100
+    sector_name = _clean_text(info.get("sector"))
+    industry_name = _clean_text(info.get("industry"))
 
     total_assets = _to_float(info.get("totalAssets"))
     total_debt = _to_float(info.get("totalDebt"))
@@ -560,6 +1244,8 @@ def fetch_stock_context(ticker: str) -> dict[str, Any]:
 
     return {
         "promoter_stake_pct": promoter_stake,
+        "sector_name": sector_name,
+        "industry_name": industry_name,
         "total_assets": total_assets,
         "total_debt": total_debt,
         "debt_to_assets": debt_to_assets,
@@ -571,6 +1257,7 @@ def fetch_stock_context(ticker: str) -> dict[str, Any]:
         "volume_ratio": volume_ratio,
         "up_down_volume_ratio": up_down_volume_ratio,
         "avg_volume_5d": avg_volume_5d,
+        "current_volume": current_volume,
         "days_to_earnings": days_to_earnings,
     }
 
@@ -581,6 +1268,7 @@ def analyse_stock(
     closes: pd.Series,
     market_pulse: dict[str, Any],
     external_news_rows: list[dict[str, str]],
+    component_weights: dict[str, float] | None = None,
 ) -> dict[str, Any] | None:
     """Compute technical/fundamental/news score and recommendation row."""
     if closes is None or len(closes) < MA_WINDOW:
@@ -774,7 +1462,18 @@ def analyse_stock(
         if dist_to_low_pct <= 18:
             dip_resilience_bonus += 2
 
-    raw_score = technical_score + fundamental_score + flow_score + dip_resilience_bonus
+    weights = component_weights or DEFAULT_COMPONENT_WEIGHTS
+    tech_w = float(weights.get("technical", DEFAULT_COMPONENT_WEIGHTS["technical"]))
+    fund_w = float(weights.get("fundamental", DEFAULT_COMPONENT_WEIGHTS["fundamental"]))
+    flow_w = float(weights.get("flow", DEFAULT_COMPONENT_WEIGHTS["flow"]))
+    resilience_w = float(weights.get("resilience", DEFAULT_COMPONENT_WEIGHTS["resilience"]))
+
+    raw_score = (
+        technical_score * tech_w
+        + fundamental_score * fund_w
+        + flow_score * flow_w
+        + dip_resilience_bonus * resilience_w
+    )
     raw_score = raw_score + float(market_pulse.get("score_boost", 0.0)) * 10
     raw_score = float(np.clip(raw_score, 10, 100))
     confidence = round(float(np.clip(raw_score / 10.0, 1.0, 10.0)), 1)
@@ -850,6 +1549,37 @@ def analyse_stock(
 
     proposed_exit_price = round(price * exit_multiplier, 2)
 
+    rolling_vol = (
+        float(closes.pct_change().dropna().tail(14).std() * 100.0)
+        if len(closes) >= 20
+        else 2.1
+    )
+    base_risk_pct = float(np.clip(max(1.8, rolling_vol * 1.35), 1.8, 4.8))
+    swing_time_stop_days = 10 if signal in {"BUY", "BUY ON DIP"} else (7 if signal == "WATCH" else None)
+    if signal in {"BUY", "BUY ON DIP"}:
+        entry_low = round(price * 0.995, 2)
+        entry_high = round(price * 1.01, 2)
+        stop_loss = round(price * (1.0 - base_risk_pct / 100.0), 2)
+        target_1 = round(price * 1.05, 2)
+        target_2 = round(price * (1.08 if can_shoot_week else 1.10), 2)
+        swing_grade = "A" if confidence >= 8.0 and combined_sentiment_score >= 0 else "B"
+    elif signal == "WATCH":
+        entry_low = round(price * 0.985, 2)
+        entry_high = round(price * 1.0, 2)
+        stop_loss = round(price * (1.0 - min(base_risk_pct + 0.5, 5.5) / 100.0), 2)
+        target_1 = round(price * 1.04, 2)
+        target_2 = round(price * 1.07, 2)
+        swing_grade = "C"
+    else:
+        entry_low = None
+        entry_high = None
+        stop_loss = None
+        target_1 = None
+        target_2 = None
+        swing_grade = "NA"
+    rr_target_1 = _format_rr(price, stop_loss, target_1) if stop_loss is not None and target_1 is not None else None
+    rr_target_2 = _format_rr(price, stop_loss, target_2) if stop_loss is not None and target_2 is not None else None
+
     return {
         "Symbol": ticker.replace(".NS", ""),
         "Company": name,
@@ -868,6 +1598,7 @@ def analyse_stock(
         "52W High Gap (%)": round(dist_to_high_pct, 2) if not np.isnan(dist_to_high_pct) else None,
         "52W Low Gap (%)": round(dist_to_low_pct, 2) if not np.isnan(dist_to_low_pct) else None,
         "Promoter / Insider Stake (%)": round(promoter_stake, 2) if promoter_stake is not None else None,
+        "Industry Sector": context.get("sector_name") or context.get("industry_name") or "NA",
         "Assets (₹ Cr)": round((context.get("total_assets") or 0.0) / 1e7, 2)
         if context.get("total_assets")
         else None,
@@ -889,6 +1620,15 @@ def analyse_stock(
         "Market Pulse": market_pulse.get("regime", "Sideways"),
         "Action": signal,
         "Recommendation": signal,
+        "Entry Zone (₹)": f"{entry_low} - {entry_high}" if entry_low is not None and entry_high is not None else "NA",
+        "Entry Price (₹)": entry_low,
+        "Stop Loss (₹)": stop_loss,
+        "Target 1 (₹)": target_1,
+        "Target 2 (₹)": target_2,
+        "Time Stop (days)": swing_time_stop_days if swing_time_stop_days is not None else "NA",
+        "RR to T1": rr_target_1,
+        "RR to T2": rr_target_2,
+        "Swing Grade": swing_grade,
         "Reason for Recommendation": reason,
         "Proposed Exit Price (₹)": proposed_exit_price,
         "Met Expectation Today": met_expectation,
@@ -900,7 +1640,22 @@ def analyse_stock(
         "Sources Used": ", ".join(ext_sources) if ext_sources else "Yahoo Finance",
         "External News Hits": ext_hit_count,
         "Avg Volume 5D": round(avg_volume_5d, 0) if avg_volume_5d is not None else None,
+        "Current Volume": round(float(context.get("current_volume")), 0)
+        if context.get("current_volume") is not None
+        else None,
         "_score_raw": raw_score,
+        "_component_scores": {
+            "technical": round(technical_score, 4),
+            "fundamental": round(fundamental_score, 4),
+            "flow": round(flow_score, 4),
+            "resilience": round(dip_resilience_bonus, 4),
+        },
+        "_component_weights": {
+            "technical": round(tech_w, 4),
+            "fundamental": round(fund_w, 4),
+            "flow": round(flow_w, 4),
+            "resilience": round(resilience_w, 4),
+        },
         "_news_rows": context.get("news_rows", []),
         "_closes": closes,
         "_ma": closes.rolling(window=MA_WINDOW).mean(),
@@ -972,6 +1727,33 @@ def build_portfolio_pie(df: pd.DataFrame) -> go.Figure:
     )
     fig.update_layout(
         title=dict(text="Portfolio Allocation (Current Value)", font=dict(size=14)),
+        template="plotly_dark",
+        paper_bgcolor="#0B0F14",
+        plot_bgcolor="#111821",
+        margin=dict(l=20, r=20, t=45, b=20),
+        height=420,
+        font=dict(color="#E8EDF4"),
+        showlegend=True,
+    )
+    return fig
+
+
+def build_bullish_candidates_pie(df: pd.DataFrame) -> go.Figure:
+    """Build favorability-share pie for selected bullish candidates."""
+    fig = go.Figure(
+        data=[
+            go.Pie(
+                labels=df["Symbol"],
+                values=df["Bullish Score"],
+                hole=0.42,
+                textinfo="label+percent",
+                textposition="outside",
+                marker=dict(line=dict(color="#0B0F14", width=1)),
+            )
+        ]
+    )
+    fig.update_layout(
+        title=dict(text="Bullish Favorability Share (Top 6)", font=dict(size=14)),
         template="plotly_dark",
         paper_bgcolor="#0B0F14",
         plot_bgcolor="#111821",
@@ -1118,7 +1900,7 @@ def inject_trading_theme() -> None:
             --bl-panel-2: #1A2230;
             --bl-border: #243041;
             --bl-text: #E8EDF4;
-            --bl-muted: #8B98A8;
+            --bl-muted: #E8EDF4;
             --bl-blue: #387ED1;
             --bl-green: #00B386;
             --bl-red: #EB5336;
@@ -1248,7 +2030,7 @@ def inject_trading_theme() -> None:
             font-weight: 600;
             letter-spacing: 0.08em;
             text-transform: uppercase;
-            color: #b7c8da;
+            color: #E8EDF4;
             border: 1px solid #33506f;
             border-radius: 999px;
             padding: 0.18rem 0.55rem;
@@ -1259,7 +2041,7 @@ def inject_trading_theme() -> None:
             align-items: center;
             gap: 0.45rem;
             font-size: 0.82rem;
-            color: #b7c8da;
+            color: #E8EDF4;
             font-family: "IBM Plex Mono", monospace;
         }
         .bl-dot {
@@ -1286,6 +2068,68 @@ def inject_trading_theme() -> None:
             display: flex;
             align-items: center;
             gap: 1rem;
+        }
+        .bl-signature-wrap {
+            display: flex;
+            flex-direction: column;
+            gap: 0.15rem;
+        }
+        .bl-signature-label {
+            display: inline-flex;
+            width: fit-content;
+            padding: 0.1rem 0.45rem;
+            border-radius: 6px;
+            background: rgba(56, 126, 209, 0.16);
+            border: 1px solid rgba(56, 126, 209, 0.34);
+            color: #BFD8F5;
+            font-size: 0.62rem;
+            font-family: "IBM Plex Mono", monospace;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+        }
+        .bl-signature {
+            display: inline-block;
+            width: fit-content;
+            margin-top: 0.05rem;
+            padding: 0.02rem 0.1rem 0.16rem 0.1rem;
+            border-bottom: 2px solid rgba(0, 179, 134, 0.55);
+            color: #FFD978;
+            font-size: 1.08rem;
+            line-height: 1.1;
+            font-family: Georgia, "Times New Roman", serif;
+            font-style: italic;
+            font-weight: 600;
+            letter-spacing: 0.03em;
+            text-shadow: 0 1px 12px rgba(255, 189, 66, 0.28);
+        }
+        .bl-signature-wrap.bl-signature-style-minimal .bl-signature-label {
+            background: rgba(232, 237, 244, 0.08);
+            border-color: rgba(232, 237, 244, 0.26);
+            color: #C9D3DF;
+        }
+        .bl-signature-wrap.bl-signature-style-minimal .bl-signature {
+            border-bottom-color: rgba(173, 185, 199, 0.55);
+            color: #FFD978;
+            font-style: normal;
+            font-weight: 500;
+            letter-spacing: 0.02em;
+            text-shadow: none;
+        }
+        .bl-signature-wrap.bl-signature-style-neon .bl-signature-label {
+            background: rgba(0, 179, 134, 0.18);
+            border-color: rgba(0, 179, 134, 0.45);
+            color: #C7FFE7;
+        }
+        .bl-signature-wrap.bl-signature-style-neon .bl-signature {
+            border-bottom-color: rgba(56, 126, 209, 0.85);
+            color: #FFD978;
+            font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+            font-style: normal;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            text-shadow:
+                0 0 8px rgba(255, 189, 66, 0.55),
+                0 0 16px rgba(255, 154, 32, 0.35);
         }
         .bl-hero-logo {
             width: 188px;
@@ -1317,7 +2161,7 @@ def inject_trading_theme() -> None:
         }
         .bl-hero-title span { color: var(--bl-blue); }
         .bl-hero-sub {
-            color: var(--bl-muted);
+            color: var(--bl-text);
             font-size: 0.9rem;
         }
         .bl-hero-chips {
@@ -1350,14 +2194,20 @@ def inject_trading_theme() -> None:
             color: #EAF2FF;
             font-weight: 700;
         }
+        .bl-notewhite {
+            color: #F3F7FF !important;
+            font-size: 0.92rem;
+            line-height: 1.45;
+            margin: 0.2rem 0;
+        }
         .bl-switch-caption {
-            color: #7f8d9f;
+            color: var(--bl-text);
             font-size: 0.9rem;
             margin: 0.1rem 0 0.05rem 0;
         }
 
         h1, h2, h3, h4 { color: var(--bl-text) !important; font-weight: 600 !important; }
-        p, label, .stMarkdown, .stCaption { color: var(--bl-muted); }
+        p, label, .stMarkdown, .stCaption { color: var(--bl-text) !important; }
         strong { color: var(--bl-text); }
 
         /* Metrics like trading KPI tiles */
@@ -1509,8 +2359,8 @@ def inject_trading_theme() -> None:
 
 
 def render_scanner_tab() -> None:
-    # Auto-refresh this view every 15 seconds.
-    st_autorefresh(interval=15_000, key="market_intel_autorefresh_15s")
+    # Auto-refresh paused for now.
+    # st_autorefresh(interval=15_000, key="market_intel_autorefresh_15s")
 
     # Pull the action row closer to the hero banner.
     st.markdown("<div style='margin-top:-2.05rem;'></div>", unsafe_allow_html=True)
@@ -1540,18 +2390,81 @@ def render_scanner_tab() -> None:
         """,
         unsafe_allow_html=True,
     )
+    refresh_interval = st.radio(
+        "Live price refresh",
+        options=["Off", "30 sec", "60 sec"],
+        index=1,
+        horizontal=True,
+        key="scanner_live_refresh_interval",
+    )
+    if refresh_interval != "Off":
+        interval_seconds = int(refresh_interval.split()[0])
+        st_autorefresh(
+            interval=interval_seconds * 1000,
+            key=f"scanner_live_autorefresh_{interval_seconds}",
+        )
+        st.caption(
+            f"Live CMP/day-change refresh is ON (every {interval_seconds} seconds)."
+        )
+
+    scan_click_dt = dt.datetime.now()
+    scan_click_time = scan_click_dt.strftime("%d %b %Y · %H:%M:%S")
+    if run_scan:
+        st.session_state["last_scan_time"] = scan_click_time
+        st.session_state["last_scan_epoch"] = scan_click_dt.timestamp()
 
     if force_refresh:
+        st.session_state["last_full_refresh_time"] = scan_click_time
+        st.session_state["last_full_refresh_epoch"] = scan_click_dt.timestamp()
+        st.session_state["last_scan_time"] = scan_click_time
+        st.session_state["last_scan_epoch"] = scan_click_dt.timestamp()
         fetch_market_data.clear()
+        fetch_nse_equity_universe.clear()
+        fetch_intraday_momentum_map.clear()
+        fetch_live_price_snapshot.clear()
         fetch_market_pulse.clear()
+        fetch_alpha_vantage_market_sentiment.clear()
         fetch_live_index_snapshot.clear()
         fetch_external_market_news.clear()
         fetch_stock_context.clear()
         st.session_state.pop("scan_results", None)
         st.session_state.pop("market_pulse", None)
         st.session_state.pop("external_news_rows", None)
+        st.session_state.pop("scan_results_nifty50", None)
+        st.session_state.pop("market_pulse_nifty50", None)
+        st.session_state.pop("external_news_rows_nifty50", None)
+        st.session_state.pop("scan_results_broad", None)
+        st.session_state.pop("market_pulse_broad", None)
+        st.session_state.pop("external_news_rows_broad", None)
+        st.session_state.pop("broad_daily_movers", None)
         st.success("Data cache cleared. Re-evaluating all signals now.")
         run_scan = True
+
+    def _freshness(time_key: str, epoch_key: str) -> tuple[str, str]:
+        shown_time = st.session_state.get(time_key)
+        epoch = st.session_state.get(epoch_key)
+        if not shown_time or epoch in (None, ""):
+            return "Never", "#E8EDF4"
+        age_mins = max(0.0, (dt.datetime.now().timestamp() - float(epoch)) / 60.0)
+        color = "#00B386" if age_mins <= 30 else "#FFB020"
+        return f"{shown_time} ({age_mins:.0f}m ago)", color
+
+    scan_text, scan_color = _freshness("last_scan_time", "last_scan_epoch")
+    refresh_text, refresh_color = _freshness(
+        "last_full_refresh_time", "last_full_refresh_epoch"
+    )
+    st.markdown(
+        f"""
+        <div class="bl-helptext" style="margin-top:0.15rem;">
+            <strong>Last scan time:</strong>
+            <span style="color:{scan_color};font-weight:600;">{scan_text}</span>
+            &nbsp;|&nbsp;
+            <strong>Last full refresh time:</strong>
+            <span style="color:{refresh_color};font-weight:600;">{refresh_text}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     header_col, index_col = st.columns([1.75, 1.55], gap="medium")
     with header_col:
@@ -1596,7 +2509,7 @@ def render_scanner_tab() -> None:
                     background:#151B24;
                     padding:0.45rem 0.55rem;
                 ">
-                  <div style="color:#8B98A8;font-size:0.72rem;line-height:1.1;">{label}</div>
+                  <div style="color:#E8EDF4;font-size:0.72rem;line-height:1.1;">{label}</div>
                   <div style="color:#E8EDF4;font-size:1.02rem;font-weight:700;line-height:1.2;">{value_text}</div>
                   <div style="color:{chg_color};font-size:0.82rem;font-weight:600;white-space:nowrap;">{delta_text}</div>
                 </div>
@@ -1613,16 +2526,80 @@ def render_scanner_tab() -> None:
             components.html(index_html, height=96, width=660)
 
     main_col = st.container()
-    search_query = str(st.session_state.get("script_search_input", "")).strip()
-    min_confidence = float(st.session_state.get("min_confidence_filter", 5.5))
+    search_query = ""
+    min_confidence = 5.5
+    high_conviction_mode = st.toggle(
+        "High Conviction (10% target) mode",
+        value=bool(st.session_state.get("high_conviction_mode_enabled", False)),
+        key="high_conviction_mode_enabled",
+        help=(
+            "Applies stricter BUY filtering: anti-chase day move cap, stronger momentum/volume flow, "
+            "promoter >=40%, and ~10% upside viability in a 5-10 day hold window."
+        ),
+    )
+    universe_scope = st.radio(
+        "Scanner universe",
+        options=["Broad market (NSE + custom)", "NIFTY 50 only"],
+        horizontal=True,
+        key="scanner_universe_scope",
+    )
+    custom_symbols_raw = ""
+    top_mover_pool = 140
+    if universe_scope == "Broad market (NSE + custom)":
+        custom_symbols_raw = st.text_area(
+            "Custom symbols (optional, comma/newline; supports .NS/.BO)",
+            value=st.session_state.get("scanner_custom_symbols", ""),
+            key="scanner_custom_symbols",
+            placeholder="Example: OLAELEC.NS, PATELSAI.NS, TATAMOTORS, RELIANCE.BO",
+        )
+        top_mover_pool = int(
+            st.slider(
+                "Daily gainers considered for deep analysis",
+                min_value=60,
+                max_value=250,
+                value=140,
+                step=10,
+                key="scanner_top_mover_pool",
+            )
+        )
+    scope_key = "broad" if universe_scope == "Broad market (NSE + custom)" else "nifty50"
+    scan_results_key = f"scan_results_{scope_key}"
+    market_pulse_key = f"market_pulse_{scope_key}"
+    external_news_key = f"external_news_rows_{scope_key}"
+    previous_top20_key = f"previous_top20_symbols_{scope_key}"
+    model_state = _load_model_state()
+    current_regime = str(
+        (st.session_state.get(market_pulse_key, {}) or {}).get("regime", "Sideways")
+    )
+    adaptive_weights = _get_regime_weights(model_state, current_regime)
 
-    should_scan = run_scan or "scan_results" not in st.session_state
+    should_scan = run_scan or scan_results_key not in st.session_state
     if should_scan:
-        tickers = tuple(NIFTY_50.keys())
+        if scope_key == "broad":
+            universe_map = fetch_nse_equity_universe()
+            custom_symbols = _parse_custom_symbols(custom_symbols_raw)
+            for ticker in custom_symbols:
+                if ticker not in universe_map:
+                    universe_map[ticker] = ticker.replace(".NS", "").replace(".BO", "")
+            tickers = tuple(universe_map.keys())
+            scan_hint = (
+                f"Scanning {len(tickers)} NSE/custom symbols for today's movers, "
+                f"then deep-analysing top {top_mover_pool} + watchlist..."
+            )
+        else:
+            universe_map = dict(NIFTY_50)
+            tickers = tuple(universe_map.keys())
+            custom_symbols = []
+            scan_hint = "Collecting NIFTY 50 market, fundamentals, and multi-source news signals..."
+
         with st.spinner("Collecting market, fundamentals, and multi-source news signals… this can take 1-3 minutes"):
             try:
-                market = fetch_market_data(tickers)
+                st.caption(scan_hint)
+                lookback_days = 140 if scope_key == "broad" else LOOKBACK_DAYS
+                market = fetch_market_data(tickers, lookback_days=lookback_days)
                 market_pulse = fetch_market_pulse()
+                current_regime = str(market_pulse.get("regime", "Sideways"))
+                adaptive_weights = _get_regime_weights(model_state, current_regime)
                 external_news_rows = fetch_external_market_news()
             except Exception as exc:
                 st.error("Could not download market data. Please check internet and retry.")
@@ -1633,16 +2610,79 @@ def render_scanner_tab() -> None:
             st.error("No price data was returned. Please try again in a few minutes.")
             return
 
+        scan_targets: list[tuple[str, str]] = []
+        if scope_key == "broad":
+            mover_rows: list[dict[str, Any]] = []
+            for ticker, closes in market.items():
+                if closes is None or len(closes) < 2:
+                    continue
+                price = float(closes.iloc[-1])
+                if price > MAX_STOCK_PRICE:
+                    continue
+                day_pct = float((closes.iloc[-1] / closes.iloc[-2] - 1.0) * 100.0)
+                five_day_pct = (
+                    float((closes.iloc[-1] / closes.iloc[-6] - 1.0) * 100.0)
+                    if len(closes) >= 6
+                    else None
+                )
+                mover_rows.append(
+                    {
+                        "Ticker": ticker,
+                        "Symbol": ticker.replace(".NS", "").replace(".BO", ""),
+                        "Company": universe_map.get(ticker, ticker),
+                        "CMP (₹)": round(price, 2),
+                        "Daily Change (%)": round(day_pct, 2),
+                        "Increased % since last 5 days": round(five_day_pct, 2)
+                        if five_day_pct is not None
+                        else None,
+                    }
+                )
+            mover_rows = sorted(mover_rows, key=lambda r: r["Daily Change (%)"], reverse=True)
+            st.session_state["broad_daily_movers"] = mover_rows[: max(120, top_mover_pool)]
+            candidate_tickers = [r["Ticker"] for r in mover_rows[:top_mover_pool]]
+            for ticker in custom_symbols:
+                if ticker not in candidate_tickers:
+                    candidate_tickers.append(ticker)
+            for ticker in NIFTY_50.keys():
+                if ticker not in candidate_tickers:
+                    candidate_tickers.append(ticker)
+            scan_targets = [(ticker, universe_map.get(ticker, ticker)) for ticker in candidate_tickers]
+        else:
+            scan_targets = list(universe_map.items())
+
         rows: list[dict[str, Any]] = []
+        feedback_returns: list[float] = []
+        scan_date = dt.date.today().isoformat()
         progress = st.progress(0, text="Analysing scripts…")
-        for i, (ticker, name) in enumerate(NIFTY_50.items(), start=1):
+        for i, (ticker, name) in enumerate(scan_targets, start=1):
             closes = market.get(ticker)
             if closes is not None:
-                row = analyse_stock(ticker, name, closes, market_pulse, external_news_rows)
+                row = analyse_stock(
+                    ticker,
+                    name,
+                    closes,
+                    market_pulse,
+                    external_news_rows,
+                    component_weights=adaptive_weights,
+                )
                 if row is not None:
+                    row["_yf_ticker"] = ticker
+                    realized = _learn_from_row_feedback(
+                        model_state, row, scan_date, current_regime=current_regime
+                    )
+                    if realized is not None:
+                        feedback_returns.append(realized)
                     rows.append(row)
-            progress.progress(i / len(NIFTY_50), text=f"Analysing {name}…")
+            progress.progress(i / max(len(scan_targets), 1), text=f"Analysing {name}…")
         progress.empty()
+        _save_model_state(model_state)
+        if feedback_returns:
+            st.session_state["adaptive_feedback_batch"] = {
+                "count": len(feedback_returns),
+                "avg_return": round(float(np.mean(feedback_returns)), 3),
+            }
+        else:
+            st.session_state["adaptive_feedback_batch"] = {"count": 0, "avg_return": 0.0}
 
         if not rows:
             st.error(
@@ -1651,33 +2691,121 @@ def render_scanner_tab() -> None:
             )
             return
 
-        st.session_state["scan_results"] = rows
-        st.session_state["market_pulse"] = market_pulse
-        st.session_state["external_news_rows"] = external_news_rows
+        if scope_key == "broad":
+            analysis_by_symbol = {str(r.get("Symbol", "")).strip(): r for r in rows}
+            enriched_movers: list[dict[str, Any]] = []
+            for mover in st.session_state.get("broad_daily_movers", []):
+                merged = dict(mover)
+                symbol_key = str(merged.get("Symbol", "")).strip()
+                analysis_row = analysis_by_symbol.get(symbol_key, {})
+                merged["Promoter Stake (%)"] = analysis_row.get("Promoter / Insider Stake (%)")
+                merged["Industry Sector"] = analysis_row.get("Industry Sector")
+                merged["Current Volume"] = analysis_row.get("Current Volume")
+                merged["Entry Price (₹)"] = analysis_row.get("Entry Price (₹)")
+                merged["Proposed Exit Price (₹)"] = analysis_row.get("Proposed Exit Price (₹)")
+                merged["Proposed Exit (₹)"] = _format_exit_with_gain(
+                    merged.get("Entry Price (₹)"),
+                    merged.get("Proposed Exit Price (₹)"),
+                )
+                merged["Minimum Holding Period (days)"] = _extract_min_days(
+                    analysis_row.get("Sell Window (next 2w, days)")
+                ) or analysis_row.get("Time Stop (days)")
+                enriched_movers.append(merged)
+            st.session_state["broad_daily_movers"] = enriched_movers
 
-    results = st.session_state["scan_results"]
+        st.session_state[scan_results_key] = rows
+        st.session_state[market_pulse_key] = market_pulse
+        st.session_state[external_news_key] = external_news_rows
+
+    results = st.session_state[scan_results_key]
     if results and (
         "Reason for Recommendation" not in results[0] or "Day changed" not in results[0]
     ):
-        st.session_state.pop("scan_results", None)
-        st.session_state.pop("market_pulse", None)
-        st.session_state.pop("external_news_rows", None)
+        st.session_state.pop(scan_results_key, None)
+        st.session_state.pop(market_pulse_key, None)
+        st.session_state.pop(external_news_key, None)
         st.info("Refreshing scan data to include newly added analysis columns…")
         st.rerun()
     if results and any((r.get("CMP (₹)") or 0) > MAX_STOCK_PRICE for r in results):
-        st.session_state.pop("scan_results", None)
-        st.session_state.pop("market_pulse", None)
-        st.session_state.pop("external_news_rows", None)
+        st.session_state.pop(scan_results_key, None)
+        st.session_state.pop(market_pulse_key, None)
+        st.session_state.pop(external_news_key, None)
         st.info(f"Refreshing scan data to apply price cap <= ₹{MAX_STOCK_PRICE:,.0f}…")
         st.rerun()
-    market_pulse = st.session_state.get("market_pulse", fetch_market_pulse())
-    external_news_rows = st.session_state.get("external_news_rows", [])
+    market_pulse = st.session_state.get(market_pulse_key, fetch_market_pulse())
+    current_regime = str(market_pulse.get("regime", "Sideways"))
+    adaptive_weights = _get_regime_weights(model_state, current_regime)
+    external_news_rows = st.session_state.get(external_news_key, [])
     sorted_results = sorted(results, key=lambda x: x["Confidence (1-10)"], reverse=True)
+
+    if high_conviction_mode:
+        demoted_count = 0
+        high_conviction_buy_count = 0
+        demoted_rows: list[dict[str, Any]] = []
+        for row in sorted_results:
+            passes_gate, failed_checks = _high_conviction_gate(row)
+            row["_high_conviction_pass"] = passes_gate
+            row["_high_conviction_failures"] = failed_checks
+            rec = str(row.get("Recommendation", "")).upper().strip()
+            if rec in {"BUY", "BUY ON DIP"}:
+                if passes_gate:
+                    high_conviction_buy_count += 1
+                else:
+                    proposed_entry = row.get("Entry Price (₹)") or row.get("CMP (₹)")
+                    proposed_exit = row.get("Proposed Exit Price (₹)")
+                    demoted_rows.append(
+                        {
+                            "Symbol": row.get("Symbol"),
+                            "Company": row.get("Company"),
+                            "Industry Sector": row.get("Industry Sector"),
+                            "Confidence": row.get("Confidence (1-10)"),
+                            "Promoter Stake (%)": row.get("Promoter / Insider Stake (%)"),
+                            "Daily Change (%)": row.get("Daily Change (%)"),
+                            "Weekly Momentum (%)": row.get("Weekly Momentum (%)"),
+                            "Volume Surge (5d/20d)": row.get("Volume Surge (5d/20d)"),
+                            "Buy/Sell Volume Ratio": row.get("Buy/Sell Volume Ratio"),
+                            "Sell Window (days)": row.get("Sell Window (next 2w, days)"),
+                            "Proposed Entry (₹)": proposed_entry,
+                            "Proposed Exit (₹)": _format_exit_with_gain(proposed_entry, proposed_exit),
+                            "Target 2 Upside (%)": _calc_exit_gain_pct(
+                                proposed_entry,
+                                row.get("Target 2 (₹)"),
+                            ),
+                            "Failed Checks": ", ".join(failed_checks),
+                        }
+                    )
+                    row["Recommendation"] = "WATCH"
+                    row["Reason for Recommendation"] = (
+                        "High Conviction mode held entry: "
+                        f"{', '.join(failed_checks[:3])}. Wait for setup improvement."
+                    )
+                    demoted_count += 1
+        st.caption(
+            "High Conviction mode active: "
+            f"{high_conviction_buy_count} buy candidates passed strict gate; "
+            f"{demoted_count} downgraded to WATCH."
+        )
+        if demoted_rows:
+            st.markdown("### Why High Conviction gate rejected buys")
+            st.dataframe(
+                style_met_expectation_dataframe(
+                    pd.DataFrame(demoted_rows).sort_values(
+                        "Confidence", ascending=False, na_position="last"
+                    )
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
     for row in sorted_results:
         row["_since_added"] = _track_since_added_change(
             "scanner_since_added_baseline",
             row.get("Symbol"),
             row.get("CMP (₹)"),
+        )
+        row["_added_on"] = _get_since_added_date(
+            "scanner_since_added_baseline",
+            row.get("Symbol"),
         )
 
     filtered = sorted_results
@@ -1703,6 +2831,30 @@ def render_scanner_tab() -> None:
             "showing the best available top 20 from the full universe."
         )
     top20 = sorted(top20, key=_confidence_value, reverse=True)
+    _refresh_rows_with_live_prices(top20, "scanner_since_added_baseline", max_rows=20)
+    intraday_tickers = tuple(
+        dict.fromkeys(
+            [
+                str(
+                    r.get("_yf_ticker")
+                    or (
+                        (str(r.get("Symbol", "")) if "." in str(r.get("Symbol", "")) else f"{r.get('Symbol', '')}.NS")
+                    )
+                )
+                for r in top20
+                if r.get("Symbol")
+            ]
+        )
+    )
+    mom_5m = fetch_intraday_momentum_map(intraday_tickers, interval="5m") if intraday_tickers else {}
+    mom_15m = fetch_intraday_momentum_map(intraday_tickers, interval="15m") if intraday_tickers else {}
+    for row in top20:
+        ticker_key = str(
+            row.get("_yf_ticker")
+            or ((str(row.get("Symbol", "")) if "." in str(row.get("Symbol", "")) else f"{row.get('Symbol', '')}.NS"))
+        )
+        row["_mom_5m"] = mom_5m.get(ticker_key)
+        row["_mom_15m"] = mom_15m.get(ticker_key)
     buy_now = sorted(
         [r for r in top20 if r["Recommendation"] in {"BUY", "BUY ON DIP"}],
         key=_confidence_value,
@@ -1726,12 +2878,31 @@ def render_scanner_tab() -> None:
         c3.metric("Top 20 Watch signals", len(watch_list))
         c4.metric("High 1-week potential", len(high_week))
 
-        st.caption(
-            f"Market pulse: **{market_pulse.get('name', 'NIFTY 50')}** is "
-            f"**{market_pulse.get('regime', 'Sideways')}** "
+        pulse_line = (
+            f"Market pulse: {market_pulse.get('name', 'NIFTY 50')} is "
+            f"{market_pulse.get('regime', 'Sideways')} "
             f"({market_pulse.get('weekly_pct', 0.0):+.2f}% weekly). "
-            f"External headlines fetched: **{len(external_news_rows)}**."
+            f"External headlines fetched: {len(external_news_rows)}. "
+            f"{market_pulse.get('ext_sentiment_source', 'Alpha Vantage')}: "
+            f"{market_pulse.get('ext_sentiment_label', 'Neutral')} "
+            f"({float(market_pulse.get('ext_sentiment_score', 0.0) or 0.0):+.2f}, "
+            f"samples {int(market_pulse.get('ext_sentiment_samples', 0) or 0)})."
         )
+        st.markdown(f"<div class='bl-notewhite'>{pulse_line}</div>", unsafe_allow_html=True)
+        adaptive_metrics = model_state.get("metrics", {}) if isinstance(model_state, dict) else {}
+        batch_feedback = st.session_state.get("adaptive_feedback_batch", {"count": 0, "avg_return": 0.0})
+        weights_line = (
+            f"Self-tuning weights for current regime ({current_regime}) — "
+            f"Tech {adaptive_weights['technical']:.2f}, "
+            f"Fund {adaptive_weights['fundamental']:.2f}, "
+            f"Flow {adaptive_weights['flow']:.2f}, "
+            f"Resilience {adaptive_weights['resilience']:.2f} | "
+            f"Learning updates: {int(adaptive_metrics.get('feedback_updates', 0) or 0)} "
+            f"(EWMA return {float(adaptive_metrics.get('avg_return_ewma', 0.0) or 0.0):+.2f}%) | "
+            f"This run feedback: {int(batch_feedback.get('count', 0) or 0)} symbols, "
+            f"avg {float(batch_feedback.get('avg_return', 0.0) or 0.0):+.2f}%"
+        )
+        st.markdown(f"<div class='bl-notewhite'>{weights_line}</div>", unsafe_allow_html=True)
 
         rank_table_rows = []
         for rank, row in enumerate(top20, start=1):
@@ -1744,12 +2915,20 @@ def render_scanner_tab() -> None:
                         row.get("Day changed"), row.get("Daily Change (%)")
                     ),
                     "Since added": row.get("_since_added", "NA"),
+                    "Added on": row.get("_added_on", "NA"),
+                    "Industry Sector": row.get("Industry Sector"),
                     "52W High (₹)": row["52W High (₹)"],
                     "Exp MA 2W (₹)": row["Expected MA (2W, ₹)"],
-                    "Proposed Exit (₹)": row["Proposed Exit Price (₹)"],
-                    "Promoter %": row["Promoter / Insider Stake (%)"],
+                    "Proposed Entry (₹)": row.get("Entry Price (₹)") or row.get("CMP (₹)"),
+                    "Proposed Exit (₹)": _format_exit_with_gain(
+                        row.get("Entry Price (₹)") or row.get("CMP (₹)"),
+                        row.get("Proposed Exit Price (₹)"),
+                    ),
+                    "Promoter Stake (%)": row["Promoter / Insider Stake (%)"],
                     "Rec": row["Recommendation"],
                     "Met Exp": row["Met Expectation Today"],
+                    "5m Mom %": row.get("_mom_5m"),
+                    "15m Mom %": row.get("_mom_15m"),
                     "Buy Win": row["Buy Window (next 2w, days)"],
                     "Sell Win": row["Sell Window (next 2w, days)"],
                     "Days to Result": row["Results Announcement (days)"],
@@ -1800,9 +2979,101 @@ def render_scanner_tab() -> None:
             use_container_width=True,
             hide_index=True,
         )
+        previous_top20 = set(st.session_state.get(previous_top20_key, []))
+        current_top20_symbols = [str(r.get("Symbol", "")) for r in top20 if r.get("Symbol")]
+        if previous_top20:
+            entrant_rows = [r for r in top20 if str(r.get("Symbol", "")) not in previous_top20]
+            st.markdown("### New entrants today")
+            if entrant_rows:
+                entrants_df = pd.DataFrame(
+                    [
+                        {
+                            "Symbol": r.get("Symbol"),
+                            "Company": r.get("Company"),
+                            "Recommendation": r.get("Recommendation"),
+                            "Confidence": r.get("Confidence (1-10)"),
+                            "CMP (₹)": r.get("CMP (₹)"),
+                            "Industry Sector": r.get("Industry Sector"),
+                            "Day changed": _format_day_change(
+                                r.get("Day changed"), r.get("Daily Change (%)")
+                            ),
+                            "Promoter Stake (%)": r.get("Promoter / Insider Stake (%)"),
+                            "Proposed Entry (₹)": r.get("Entry Price (₹)") or r.get("CMP (₹)"),
+                            "Proposed Exit (₹)": _format_exit_with_gain(
+                                r.get("Entry Price (₹)") or r.get("CMP (₹)"),
+                                r.get("Proposed Exit Price (₹)"),
+                            ),
+                            "Added on": r.get("_added_on", "NA"),
+                            "5m Mom %": r.get("_mom_5m"),
+                            "15m Mom %": r.get("_mom_15m"),
+                        }
+                        for r in entrant_rows
+                    ]
+                )
+                st.dataframe(
+                    style_met_expectation_dataframe(entrants_df),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.info("No new entrants compared with the previous scan run.")
+        st.session_state[previous_top20_key] = current_top20_symbols
 
-        # Removed redundant strict-actionable table to avoid duplication with
-        # "Favourable right now" and keep the dashboard decision-first.
+        st.markdown("### Swing candidate engine (3-10 days)")
+        swing_candidates = sorted(
+            [
+                r
+                for r in filtered
+                if r.get("Recommendation") in {"BUY", "BUY ON DIP", "WATCH"}
+                and float(r.get("Confidence (1-10)", 0.0) or 0.0) >= 6.6
+            ],
+            key=_confidence_value,
+            reverse=True,
+        )[:25]
+        if swing_candidates:
+            for candidate in swing_candidates:
+                score, tag, color = _trade_card_score_tag(candidate)
+                candidate["_card_score"] = score
+                candidate["_card_tag"] = tag
+                candidate["_card_color"] = color
+            swing_candidates_df = pd.DataFrame(
+                [
+                    {
+                        "Symbol": r.get("Symbol"),
+                        "Added on": r.get("_added_on", "NA"),
+                        "Rec": r.get("Recommendation"),
+                        "Swing Grade": r.get("Swing Grade"),
+                        "Card Score": r.get("_card_score"),
+                        "Card Tag": r.get("_card_tag"),
+                        "Confidence": r.get("Confidence (1-10)"),
+                        "CMP (₹)": r.get("CMP (₹)"),
+                        "Industry Sector": r.get("Industry Sector"),
+                        "Proposed Entry (₹)": r.get("Entry Price (₹)") or r.get("CMP (₹)"),
+                        "Proposed Exit (₹)": _format_exit_with_gain(
+                            r.get("Entry Price (₹)") or r.get("CMP (₹)"),
+                            r.get("Proposed Exit Price (₹)"),
+                        ),
+                        "Entry Zone (₹)": r.get("Entry Zone (₹)"),
+                        "Stop Loss (₹)": r.get("Stop Loss (₹)"),
+                        "Target 1 (₹)": r.get("Target 1 (₹)"),
+                        "Target 2 (₹)": r.get("Target 2 (₹)"),
+                        "Time Stop (days)": r.get("Time Stop (days)"),
+                        "Promoter Stake (%)": r.get("Promoter / Insider Stake (%)"),
+                        "RR to T1": r.get("RR to T1"),
+                        "RR to T2": r.get("RR to T2"),
+                        "5m Mom %": r.get("_mom_5m"),
+                        "15m Mom %": r.get("_mom_15m"),
+                    }
+                    for r in swing_candidates
+                ]
+            )
+            st.dataframe(
+                style_met_expectation_dataframe(swing_candidates_df),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("No swing candidates matched confidence and recommendation rules.")
 
         fav_now = sorted(
             [r for r in top20 if r["Recommendation"] in {"BUY", "BUY ON DIP"}],
@@ -1837,8 +3108,15 @@ def render_scanner_tab() -> None:
                             r.get("Day changed"), r.get("Daily Change (%)")
                         ),
                         "Since added": r.get("_since_added", "NA"),
+                        "Added on": r.get("_added_on", "NA"),
+                        "Industry Sector": r.get("Industry Sector"),
                         "Confidence": r.get("Confidence (1-10)"),
-                        "Proposed Exit (₹)": r.get("Proposed Exit Price (₹)"),
+                        "Promoter Stake (%)": r.get("Promoter / Insider Stake (%)"),
+                        "Proposed Entry (₹)": r.get("Entry Price (₹)") or r.get("CMP (₹)"),
+                        "Proposed Exit (₹)": _format_exit_with_gain(
+                            r.get("Entry Price (₹)") or r.get("CMP (₹)"),
+                            r.get("Proposed Exit Price (₹)"),
+                        ),
                         "Avg Vol 5D": r.get("Avg Volume 5D"),
                         "Buy/Sell Vol Ratio": r.get("Buy/Sell Volume Ratio"),
                         "Sell Window (days)": r.get("Sell Window (next 2w, days)"),
@@ -1878,8 +3156,15 @@ def render_scanner_tab() -> None:
                             r.get("Day changed"), r.get("Daily Change (%)")
                         ),
                         "Since added": r.get("_since_added", "NA"),
+                        "Added on": r.get("_added_on", "NA"),
+                        "Industry Sector": r.get("Industry Sector"),
                         "Confidence": r.get("Confidence (1-10)"),
-                        "Proposed Exit (₹)": r.get("Proposed Exit Price (₹)"),
+                        "Promoter Stake (%)": r.get("Promoter / Insider Stake (%)"),
+                        "Proposed Entry (₹)": r.get("Entry Price (₹)") or r.get("CMP (₹)"),
+                        "Proposed Exit (₹)": _format_exit_with_gain(
+                            r.get("Entry Price (₹)") or r.get("CMP (₹)"),
+                            r.get("Proposed Exit Price (₹)"),
+                        ),
                         "Avg Vol 5D": r.get("Avg Volume 5D"),
                         "Buy/Sell Vol Ratio": r.get("Buy/Sell Volume Ratio"),
                         "Buy Window (days)": r.get("Buy Window (next 2w, days)"),
@@ -1897,33 +3182,509 @@ def render_scanner_tab() -> None:
         else:
             st.info("No near-future watch candidates under current filter.")
 
-        panel_controls, panel_pulse = st.columns([1.6, 1.0], gap="large")
-        with panel_controls:
-            st.markdown("### Scan Controls")
-            st.text_input(
-                "Search script name or symbol",
-                placeholder="Example: TCS, Reliance, HDFC Bank",
-                key="script_search_input",
+        st.markdown("### Top 6 bullish buy candidates (5-10 days)")
+        strict_bullish_rows: list[dict[str, Any]] = []
+        fallback_bullish_rows: list[dict[str, Any]] = []
+        for row in filtered:
+            recommendation = str(row.get("Recommendation", "")).upper()
+            if recommendation not in {"BUY", "BUY ON DIP"}:
+                continue
+            promoter_stake = _to_float(row.get("Promoter / Insider Stake (%)"))
+            if promoter_stake is None or promoter_stake < 40.0:
+                continue
+            cmp_value = _to_float(row.get("CMP (₹)"))
+            target_2 = _to_float(row.get("Target 2 (₹)"))
+            if cmp_value is None or target_2 is None or cmp_value <= 0:
+                continue
+            target_2_upside_pct = ((target_2 / cmp_value) - 1.0) * 100.0
+            conf_value = float(row.get("Confidence (1-10)", 0.0) or 0.0)
+            weekly_momentum = _to_float(row.get("Weekly Momentum (%)")) or 0.0
+            volume_surge = _to_float(row.get("Volume Surge (5d/20d)")) or 1.0
+            sentiment_label = str(row.get("News Sentiment", "Neutral")).strip().upper()
+            sell_window = row.get("Sell Window (next 2w, days)")
+            time_stop_days = _to_float(row.get("Time Stop (days)"))
+            holding_window_ok = _window_overlaps(sell_window, 5, 10) or (
+                time_stop_days is not None and 5 <= time_stop_days <= 10
             )
-            st.slider("Minimum confidence score", 1.0, 10.0, 5.5, 0.5, key="min_confidence_filter")
-            with st.expander("How recommendations are generated"):
-                st.markdown(
-                    """
-                    - **Technicals:** CMP vs moving averages, RSI, weekly momentum, and 52-week range behavior  
-                    - **Fundamentals:** promoter/insider stake proxy, assets/liabilities, sales growth, margin quality  
-                    - **Flow + sentiment:** buy/sell volume trend, earnings/event timing, and live headline sentiment  
-                    - **Sources used (available access):** Yahoo Finance, Moneycontrol-related headlines, Economic Times-related headlines, Zerodha blog feed, and Screener-related headlines  
-                    - Output is a **ranked confidence score (1 to 10)** plus **BUY / WATCH / HOLD / SELL**
-                    """
+            if not holding_window_ok:
+                continue
+
+            sentiment_score = 1.0 if sentiment_label == "POSITIVE" else (0.7 if sentiment_label == "NEUTRAL" else 0.3)
+            confidence_score = float(np.clip(conf_value / 10.0, 0.0, 1.0))
+            upside_score = float(np.clip((target_2_upside_pct - 8.0) / 4.0, 0.0, 1.0))
+            promoter_score = float(np.clip((promoter_stake - 40.0) / 35.0, 0.0, 1.0))
+            momentum_score = float(np.clip(weekly_momentum / 4.0, 0.0, 1.0))
+            volume_score = float(np.clip((volume_surge - 0.8) / 0.8, 0.0, 1.0))
+            bullish_score = (
+                confidence_score * 0.34
+                + upside_score * 0.24
+                + promoter_score * 0.16
+                + momentum_score * 0.14
+                + volume_score * 0.08
+                + sentiment_score * 0.04
+            )
+            candidate_row = {
+                "Symbol": row.get("Symbol"),
+                "Company": row.get("Company"),
+                "Industry Sector": row.get("Industry Sector"),
+                "Recommendation": row.get("Recommendation"),
+                "Confidence": conf_value,
+                "CMP (₹)": cmp_value,
+                "Proposed Entry (₹)": row.get("Entry Price (₹)") or cmp_value,
+                "Proposed Exit Price (₹)": _to_float(row.get("Proposed Exit Price (₹)")),
+                "Proposed Exit (₹)": _format_exit_with_gain(
+                    row.get("Entry Price (₹)") or cmp_value,
+                    row.get("Proposed Exit Price (₹)"),
+                ),
+                "Target 2 (₹)": target_2,
+                "Target 2 Upside (%)": round(target_2_upside_pct, 2),
+                "Sell Window (days)": sell_window,
+                "Time Stop (days)": row.get("Time Stop (days)"),
+                "Promoter Stake (%)": round(promoter_stake, 2),
+                "Weekly Momentum (%)": round(float(weekly_momentum), 2),
+                "Volume Surge (5d/20d)": round(float(volume_surge), 2),
+                "Bullish Score": round(float(bullish_score), 4),
+            }
+            if (
+                target_2_upside_pct >= 10.0
+                and conf_value >= 7.0
+                and weekly_momentum > 0
+                and sentiment_label != "NEGATIVE"
+            ):
+                strict_bullish_rows.append(candidate_row)
+            elif target_2_upside_pct >= 8.0 and conf_value >= 6.6:
+                fallback_bullish_rows.append(candidate_row)
+
+        strict_bullish_rows = sorted(strict_bullish_rows, key=lambda x: x.get("Bullish Score", 0.0), reverse=True)
+        fallback_bullish_rows = sorted(
+            fallback_bullish_rows,
+            key=lambda x: x.get("Bullish Score", 0.0),
+            reverse=True,
+        )
+        selected_bullish_rows = strict_bullish_rows[:6]
+        if len(selected_bullish_rows) < 6:
+            used_symbols = {str(r.get("Symbol", "")) for r in selected_bullish_rows}
+            for row in fallback_bullish_rows:
+                symbol = str(row.get("Symbol", ""))
+                if symbol in used_symbols:
+                    continue
+                selected_bullish_rows.append(row)
+                used_symbols.add(symbol)
+                if len(selected_bullish_rows) >= 6:
+                    break
+
+        if selected_bullish_rows:
+            selected_bullish_df = pd.DataFrame(selected_bullish_rows)
+            score_total = float(selected_bullish_df["Bullish Score"].sum())
+            if score_total > 0:
+                selected_bullish_df["Bullish Share (%)"] = (
+                    selected_bullish_df["Bullish Score"] / score_total * 100.0
+                ).round(2)
+            else:
+                selected_bullish_df["Bullish Share (%)"] = 0.0
+            selected_bullish_df = selected_bullish_df.sort_values(
+                "Bullish Score", ascending=False, na_position="last"
+            ).reset_index(drop=True)
+
+            if len(strict_bullish_rows) < 6:
+                st.caption(
+                    "Filled remaining slots using near-match candidates "
+                    "(>=8% Target-2 upside) to keep at least 6 stocks."
+                )
+            st.caption(
+                "Filter used: BUY / BUY ON DIP, promoter stake >=40%, 5-10 day hold window, "
+                "and strong bullish support (confidence, momentum, volume, sentiment)."
+            )
+
+            pie_col, table_col = st.columns([1.15, 1.85], gap="large")
+            with pie_col:
+                st.plotly_chart(
+                    build_bullish_candidates_pie(selected_bullish_df),
+                    use_container_width=True,
+                )
+            with table_col:
+                st.dataframe(
+                    style_met_expectation_dataframe(
+                        selected_bullish_df[
+                            [
+                                "Symbol",
+                                "Industry Sector",
+                                "Recommendation",
+                                "Confidence",
+                                "CMP (₹)",
+                                "Proposed Entry (₹)",
+                                "Proposed Exit (₹)",
+                                "Promoter Stake (%)",
+                                "Target 2 Upside (%)",
+                                "Sell Window (days)",
+                                "Bullish Share (%)",
+                            ]
+                        ]
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        else:
+            st.info(
+                "No stocks currently match promoter >=40%, 5-10 day hold, and bullish buy criteria."
+            )
+
+        if scope_key == "broad":
+            movers_df = pd.DataFrame(st.session_state.get("broad_daily_movers", [])[:20])
+            if not movers_df.empty:
+                preferred_movers_cols = [
+                    "Symbol",
+                    "Company",
+                    "CMP (₹)",
+                    "Industry Sector",
+                    "Promoter Stake (%)",
+                    "Current Volume",
+                    "Entry Price (₹)",
+                    "Proposed Exit (₹)",
+                    "Minimum Holding Period (days)",
+                    "Increased % since last 5 days",
+                    "Daily Change (%)",
+                ]
+                movers_df = movers_df.drop(
+                    columns=["Proposed Exit Price (₹)", "Proposed Exit Gain (%)"],
+                    errors="ignore",
+                )
+                existing_movers_cols = [c for c in preferred_movers_cols if c in movers_df.columns]
+                remaining_movers_cols = [c for c in movers_df.columns if c not in existing_movers_cols]
+                movers_df = movers_df[existing_movers_cols + remaining_movers_cols]
+                st.markdown("### Today's broad-market gainers")
+                st.dataframe(
+                    style_met_expectation_dataframe(movers_df),
+                    use_container_width=True,
+                    hide_index=True,
                 )
 
-        with panel_pulse:
-            st.markdown("### Market Pulse")
-            st.metric("NIFTY Weekly", f"{market_pulse.get('weekly_pct', 0.0):+.2f}%")
-            st.metric("Regime", market_pulse.get("regime", "Sideways"))
-            st.metric("Headlines", len(external_news_rows))
+        st.markdown("### Trade card popout")
+        if swing_candidates:
+            trade_card_options = {
+                f"{r.get('Company')} ({r.get('Symbol')}) · {r.get('Recommendation')}": r
+                for r in swing_candidates
+            }
+            selected_trade_card_label = st.selectbox(
+                "Select stock for trade card",
+                list(trade_card_options.keys()),
+                key=f"trade_card_pick_{scope_key}",
+            )
+            trade_card_row = trade_card_options[selected_trade_card_label]
+            with st.expander("Open trade card", expanded=True):
+                tc_cap_col, tc_risk_col, tc_alloc_col = st.columns(3)
+                tc_capital = float(
+                    tc_cap_col.number_input(
+                        "Capital (₹)",
+                        min_value=10000.0,
+                        value=200000.0,
+                        step=10000.0,
+                        key=f"trade_card_capital_{scope_key}",
+                    )
+                )
+                tc_risk_pct = float(
+                    tc_risk_col.slider(
+                        "Risk/trade %",
+                        min_value=0.5,
+                        max_value=3.0,
+                        value=1.0,
+                        step=0.1,
+                        key=f"trade_card_risk_{scope_key}",
+                    )
+                )
+                tc_alloc_pct = float(
+                    tc_alloc_col.slider(
+                        "Max alloc %",
+                        min_value=5.0,
+                        max_value=35.0,
+                        value=20.0,
+                        step=1.0,
+                        key=f"trade_card_alloc_{scope_key}",
+                    )
+                )
 
-        st.markdown("---")
+                tc_entry = _to_float(trade_card_row.get("CMP (₹)")) or 0.0
+                tc_stop = _to_float(trade_card_row.get("Stop Loss (₹)"))
+                tc_t1 = _to_float(trade_card_row.get("Target 1 (₹)"))
+                tc_t2 = _to_float(trade_card_row.get("Target 2 (₹)"))
+                tc_rr1 = _format_rr(tc_entry, tc_stop, tc_t1) if tc_stop and tc_t1 else None
+                tc_rr2 = _format_rr(tc_entry, tc_stop, tc_t2) if tc_stop and tc_t2 else None
+                tc_risk_share = (tc_entry - tc_stop) if tc_stop is not None else 0.0
+                tc_risk_budget = tc_capital * (tc_risk_pct / 100.0)
+                tc_qty_risk = int(tc_risk_budget / tc_risk_share) if tc_risk_share > 0 else 0
+                tc_qty_alloc = int((tc_capital * (tc_alloc_pct / 100.0)) / tc_entry) if tc_entry > 0 else 0
+                tc_qty = max(0, min(tc_qty_risk, tc_qty_alloc))
+                tc_est_invested = round(tc_qty * tc_entry, 2)
+
+                mcol1, mcol2, mcol3, mcol4 = st.columns(4)
+                mcol1.metric("Entry", f"₹{tc_entry:,.2f}")
+                mcol2.metric("Stop", f"₹{(tc_stop or 0):,.2f}")
+                mcol3.metric("Target 1", f"₹{(tc_t1 or 0):,.2f}", f"RR {tc_rr1 if tc_rr1 is not None else 'NA'}")
+                mcol4.metric("Target 2", f"₹{(tc_t2 or 0):,.2f}", f"RR {tc_rr2 if tc_rr2 is not None else 'NA'}")
+
+                tc_score, tc_tag, tc_color = _trade_card_score_tag(trade_card_row)
+                st.markdown(
+                    f"<div style='margin:0.25rem 0 0.35rem 0;'>"
+                    f"<span style='display:inline-block;padding:0.18rem 0.6rem;border-radius:999px;"
+                    f"background:rgba(14,20,29,0.65);border:1px solid {tc_color};color:{tc_color};"
+                    f"font-weight:700;font-size:0.82rem;'>"
+                    f"{tc_tag.upper()} · SCORE {tc_score}/100"
+                    f"</span></div>",
+                    unsafe_allow_html=True,
+                )
+
+                st.caption(
+                    f"Qty: {tc_qty} | Estimated invested: ₹{tc_est_invested:,.2f} | "
+                    f"Risk/share: ₹{tc_risk_share:,.2f} | Time stop: {trade_card_row.get('Time Stop (days)', 'NA')} days"
+                )
+                tc_checklist = [
+                    ("Signal is BUY / BUY ON DIP", trade_card_row.get("Recommendation") in {"BUY", "BUY ON DIP"}),
+                    ("Confidence >= 7.0", float(trade_card_row.get("Confidence (1-10)", 0.0) or 0.0) >= 7.0),
+                    ("RR to T1 >= 1.8", tc_rr1 is not None and tc_rr1 >= 1.8),
+                    ("RR to T2 >= 2.2", tc_rr2 is not None and tc_rr2 >= 2.2),
+                    (
+                        "Intraday momentum not weak",
+                        (trade_card_row.get("_mom_5m") is None or float(trade_card_row.get("_mom_5m") or 0.0) >= -0.2)
+                        and (trade_card_row.get("_mom_15m") is None or float(trade_card_row.get("_mom_15m") or 0.0) >= -0.3),
+                    ),
+                    ("No near result risk (>= 2 days)", (trade_card_row.get("Results Announcement (days)") or 99) >= 2),
+                ]
+                st.markdown(
+                    "  \n".join([f"{'PASS' if ok else 'CHECK'} - {label}" for label, ok in tc_checklist])
+                )
+                if st.button("Add this trade card to journal", key=f"trade_card_add_{scope_key}"):
+                    if tc_qty <= 0 or tc_stop is None:
+                        st.warning("Cannot add: quantity is zero or stop-loss is unavailable.")
+                    else:
+                        trade_id = f"{trade_card_row.get('Symbol')}-{int(dt.datetime.now().timestamp())}"
+                        tc_trade = {
+                            "id": trade_id,
+                            "opened_on": dt.date.today().isoformat(),
+                            "symbol": trade_card_row.get("Symbol"),
+                            "yf_ticker": trade_card_row.get("_yf_ticker") or f"{trade_card_row.get('Symbol')}.NS",
+                            "company": trade_card_row.get("Company"),
+                            "industry_sector": trade_card_row.get("Industry Sector"),
+                            "recommendation": trade_card_row.get("Recommendation"),
+                            "qty": tc_qty,
+                            "entry_price": round(tc_entry, 2),
+                            "stop_loss": round(tc_stop, 2),
+                            "target_1": round(tc_t1, 2) if tc_t1 is not None else None,
+                            "target_2": round(tc_t2, 2) if tc_t2 is not None else None,
+                            "time_stop_days": trade_card_row.get("Time Stop (days)"),
+                            "status": "OPEN",
+                            "exit_price": None,
+                            "closed_on": None,
+                            "notes": "Added via trade card",
+                        }
+                        if "paper_trade_journal_rows" not in st.session_state:
+                            st.session_state["paper_trade_journal_rows"] = _load_trade_journal()
+                        rows_now = list(st.session_state.get("paper_trade_journal_rows", []))
+                        rows_now.insert(0, tc_trade)
+                        _upsert_journal_in_session(rows_now)
+                        st.success(f"Added {trade_card_row.get('Symbol')} from trade card.")
+                        st.rerun()
+        else:
+            st.info("Trade card will appear after swing candidates are available.")
+
+        st.markdown("### Position sizing and trade journal")
+        if "paper_trade_journal_rows" not in st.session_state:
+            st.session_state["paper_trade_journal_rows"] = _load_trade_journal()
+        journal_rows: list[dict[str, Any]] = list(st.session_state.get("paper_trade_journal_rows", []))
+
+        sizing_col, close_col = st.columns([2.1, 1.4], gap="large")
+        with sizing_col:
+            capital = float(st.number_input("Paper capital (₹)", min_value=10000.0, value=200000.0, step=10000.0))
+            risk_per_trade_pct = float(
+                st.slider("Risk per trade (% of capital)", min_value=0.5, max_value=3.0, value=1.0, step=0.1)
+            )
+            max_alloc_pct = float(
+                st.slider("Max capital allocation per trade (%)", min_value=5.0, max_value=35.0, value=20.0, step=1.0)
+            )
+            if swing_candidates:
+                swing_options = {
+                    f"{r.get('Company')} ({r.get('Symbol')}) · {r.get('Recommendation')}": r
+                    for r in swing_candidates
+                }
+                selected_swing_label = st.selectbox(
+                    "Select candidate for sizing",
+                    list(swing_options.keys()),
+                    key=f"swing_sizing_pick_{scope_key}",
+                )
+                selected_swing = swing_options[selected_swing_label]
+                entry_price = float(selected_swing.get("CMP (₹)") or 0.0)
+                stop_loss = _to_float(selected_swing.get("Stop Loss (₹)"))
+                target_1 = _to_float(selected_swing.get("Target 1 (₹)"))
+                target_2 = _to_float(selected_swing.get("Target 2 (₹)"))
+                risk_per_share = (entry_price - stop_loss) if stop_loss is not None else 0.0
+                risk_budget = capital * (risk_per_trade_pct / 100.0)
+                qty_by_risk = int(risk_budget / risk_per_share) if risk_per_share > 0 else 0
+                qty_by_alloc = int((capital * (max_alloc_pct / 100.0)) / entry_price) if entry_price > 0 else 0
+                suggested_qty = max(0, min(qty_by_risk, qty_by_alloc))
+                est_invested = round(suggested_qty * entry_price, 2)
+                st.caption(
+                    f"Suggested qty: {suggested_qty} | Risk/share: ₹{risk_per_share:,.2f} | "
+                    f"Est. invested: ₹{est_invested:,.2f}"
+                )
+                add_trade = st.button("Add to paper journal", key=f"add_paper_trade_{scope_key}")
+                if add_trade and suggested_qty > 0 and stop_loss is not None:
+                    trade_id = f"{selected_swing.get('Symbol')}-{int(dt.datetime.now().timestamp())}"
+                    new_trade = {
+                        "id": trade_id,
+                        "opened_on": dt.date.today().isoformat(),
+                        "symbol": selected_swing.get("Symbol"),
+                        "yf_ticker": selected_swing.get("_yf_ticker")
+                        or f"{selected_swing.get('Symbol')}.NS",
+                        "company": selected_swing.get("Company"),
+                        "industry_sector": selected_swing.get("Industry Sector"),
+                        "recommendation": selected_swing.get("Recommendation"),
+                        "qty": suggested_qty,
+                        "entry_price": round(entry_price, 2),
+                        "stop_loss": round(stop_loss, 2),
+                        "target_1": round(target_1, 2) if target_1 is not None else None,
+                        "target_2": round(target_2, 2) if target_2 is not None else None,
+                        "time_stop_days": selected_swing.get("Time Stop (days)"),
+                        "status": "OPEN",
+                        "exit_price": None,
+                        "closed_on": None,
+                        "notes": "",
+                    }
+                    journal_rows.insert(0, new_trade)
+                    _upsert_journal_in_session(journal_rows)
+                    st.success(f"Added {selected_swing.get('Symbol')} to paper journal.")
+                    st.rerun()
+            else:
+                st.info("Run scan first to generate swing sizing candidates.")
+
+        with close_col:
+            open_trades = [t for t in journal_rows if str(t.get("status", "")).upper() == "OPEN"]
+            if open_trades:
+                close_options = {
+                    f"{t.get('symbol')} · Qty {t.get('qty')} · Entry ₹{t.get('entry_price')}": t
+                    for t in open_trades
+                }
+                close_label = st.selectbox(
+                    "Close open trade",
+                    list(close_options.keys()),
+                    key=f"close_trade_pick_{scope_key}",
+                )
+                close_trade = close_options[close_label]
+                close_price = st.number_input(
+                    "Exit price (₹)",
+                    min_value=0.0,
+                    value=float(close_trade.get("entry_price") or 0.0),
+                    step=0.5,
+                    key=f"close_trade_price_{scope_key}",
+                )
+                close_note = st.text_input("Close note (optional)", key=f"close_trade_note_{scope_key}")
+                if st.button("Mark as closed", key=f"mark_closed_{scope_key}"):
+                    for row in journal_rows:
+                        if row.get("id") == close_trade.get("id"):
+                            row["status"] = "CLOSED"
+                            row["exit_price"] = round(float(close_price), 2)
+                            row["closed_on"] = dt.date.today().isoformat()
+                            row["notes"] = close_note
+                            break
+                    _upsert_journal_in_session(journal_rows)
+                    st.success(f"Closed {close_trade.get('symbol')} in paper journal.")
+                    st.rerun()
+            else:
+                st.info("No open paper trades.")
+
+        journal_rows = list(st.session_state.get("paper_trade_journal_rows", journal_rows))
+        if journal_rows:
+            journal_view_rows: list[dict[str, Any]] = []
+            for row in journal_rows:
+                entry = _to_float(row.get("entry_price"))
+                qty = int(row.get("qty") or 0)
+                exit_price = _to_float(row.get("exit_price"))
+                status = str(row.get("status", "OPEN")).upper()
+                current_price = None
+                symbol = str(row.get("symbol", "") or "")
+                yf_ticker = str(row.get("yf_ticker", "") or "").strip()
+                if status == "OPEN" and symbol:
+                    if not yf_ticker:
+                        yf_ticker = symbol if "." in symbol else f"{symbol}.NS"
+                    snapshot = fetch_live_price_snapshot(yf_ticker)
+                    if snapshot:
+                        current_price = float(snapshot.get("price", 0.0) or 0.0)
+                used_price = exit_price if status == "CLOSED" else current_price
+                pnl = ((used_price - entry) * qty) if (used_price is not None and entry is not None and qty > 0) else None
+                pnl_pct = (((used_price / entry) - 1.0) * 100.0) if (used_price is not None and entry and entry > 0) else None
+                journal_view_rows.append(
+                    {
+                        "Status": status,
+                        "Opened": row.get("opened_on"),
+                        "Closed": row.get("closed_on") or "-",
+                        "Symbol": symbol,
+                        "Industry Sector": row.get("industry_sector") or "NA",
+                        "Qty": qty,
+                        "Entry": entry,
+                        "Live/Exit": used_price if used_price is not None else "-",
+                        "Stop": row.get("stop_loss"),
+                        "T1": row.get("target_1"),
+                        "T2": row.get("target_2"),
+                        "P/L (₹)": round(float(pnl), 2) if pnl is not None else "-",
+                        "P/L (%)": round(float(pnl_pct), 2) if pnl_pct is not None else "-",
+                        "Notes": row.get("notes") or "",
+                    }
+                )
+            st.dataframe(
+                style_met_expectation_dataframe(pd.DataFrame(journal_view_rows)),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.markdown("### Performance analytics and go-live checklist")
+        closed_trades = [t for t in journal_rows if str(t.get("status", "")).upper() == "CLOSED"]
+        open_trades = [t for t in journal_rows if str(t.get("status", "")).upper() == "OPEN"]
+        closed_returns: list[float] = []
+        closed_pnls: list[float] = []
+        hold_days: list[int] = []
+        for t in closed_trades:
+            entry = _to_float(t.get("entry_price"))
+            exit_p = _to_float(t.get("exit_price"))
+            qty = int(t.get("qty") or 0)
+            if entry and exit_p and qty > 0:
+                ret = ((exit_p / entry) - 1.0) * 100.0
+                pnl = (exit_p - entry) * qty
+                closed_returns.append(ret)
+                closed_pnls.append(pnl)
+            try:
+                d0 = dt.date.fromisoformat(str(t.get("opened_on")))
+                d1 = dt.date.fromisoformat(str(t.get("closed_on")))
+                hold_days.append((d1 - d0).days)
+            except Exception:
+                continue
+        win_count = len([r for r in closed_returns if r > 0])
+        loss_count = len([r for r in closed_returns if r <= 0])
+        win_rate = (win_count / len(closed_returns) * 100.0) if closed_returns else 0.0
+        avg_return = float(np.mean(closed_returns)) if closed_returns else 0.0
+        avg_hold_days = float(np.mean(hold_days)) if hold_days else 0.0
+        gross_profit = float(sum([p for p in closed_pnls if p > 0]))
+        gross_loss = abs(float(sum([p for p in closed_pnls if p < 0])))
+        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (99.0 if gross_profit > 0 else 0.0)
+        analytics_col_1, analytics_col_2, analytics_col_3, analytics_col_4 = st.columns(4)
+        analytics_col_1.metric("Closed paper trades", len(closed_trades))
+        analytics_col_2.metric("Win rate", f"{win_rate:.1f}%")
+        analytics_col_3.metric("Avg return / trade", f"{avg_return:+.2f}%")
+        analytics_col_4.metric("Avg hold days", f"{avg_hold_days:.1f}")
+        checklist = [
+            ("At least 15 closed paper trades", len(closed_trades) >= 15),
+            ("Win rate >= 55%", win_rate >= 55.0),
+            ("Avg return >= +2.0%", avg_return >= 2.0),
+            ("Profit factor >= 1.30", profit_factor >= 1.30),
+            ("Avg hold <= 10 days", avg_hold_days > 0 and avg_hold_days <= 10.0),
+            ("No open trade older than 10 days", not any(
+                (dt.date.today() - dt.date.fromisoformat(str(t.get("opened_on")))).days > 10
+                for t in open_trades
+                if t.get("opened_on")
+            )),
+        ]
+        checklist_lines = [
+            f"{'PASS' if ok else 'PENDING'} - {label}" for label, ok in checklist
+        ]
+        st.markdown("  \n".join(checklist_lines))
+
         st.markdown("### Script analysis")
         options = {f"{r['Company']} ({r['Symbol']})": r for r in top20}
         labels = list(options.keys())
@@ -2139,23 +3900,31 @@ def render_holdings_tab() -> None:
         )
     if "Day changed" not in df.columns:
         df["Day changed"] = "NA"
-    if "Since added" not in df.columns:
-        df["Since added"] = "NA"
-    df["Since added"] = df.apply(
-        lambda row: _track_since_added_change(
-            "holdings_since_added_baseline",
-            row.get("Symbol"),
-            row.get("LTP (₹)"),
-        ),
-        axis=1,
-    )
-
+    if "Industry Sector" not in df.columns:
+        scan_results_for_sector = (
+            st.session_state.get("scan_results_broad")
+            or st.session_state.get("scan_results_nifty50")
+            or st.session_state.get("scan_results")
+            or []
+        )
+        sector_map = {
+            str(r.get("Symbol", "")).strip(): (r.get("Industry Sector") or "NA")
+            for r in scan_results_for_sector
+            if r.get("Symbol")
+        }
+        df["Industry Sector"] = (
+            df["Symbol"]
+            .astype(str)
+            .str.strip()
+            .map(sector_map)
+            .fillna("NA")
+        )
     preferred_holdings_cols = [
         "Symbol",
+        "Industry Sector",
         "Exchange",
         "Qty",
         "Day changed",
-        "Since added",
         "Avg Cost (₹)",
         "LTP (₹)",
         "Invested (₹)",
@@ -2172,27 +3941,71 @@ def render_holdings_tab() -> None:
     pnl = float(df["P&L (₹)"].sum())
     pnl_pct = ((current - invested) / invested * 100.0) if invested else 0.0
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Holdings", len(df))
-    m2.metric("Invested", f"₹{invested:,.2f}")
-    m3.metric("Current value", f"₹{current:,.2f}")
-    m4.metric("Overall P&L", f"₹{pnl:,.2f}", f"{pnl_pct:+.2f}%")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Invested", f"₹{invested:,.2f}")
+    m2.metric("Current value", f"₹{current:,.2f}")
+    m3.metric("Overall P&L", f"₹{pnl:,.2f}", f"{pnl_pct:+.2f}%")
 
-    chart_col, table_col = st.columns([1, 2])
-    with chart_col:
-        st.plotly_chart(build_portfolio_pie(df), use_container_width=True)
-    with table_col:
-        st.dataframe(
-            style_holdings_dataframe(df),
-            use_container_width=True,
-            hide_index=True,
+    sort_col, order_col, visible_col = st.columns([1.2, 1.0, 2.4], gap="small")
+    with sort_col:
+        sort_by = st.selectbox(
+            "Sort by",
+            options=[c for c in ["Current (₹)", "P&L (₹)", "Invested (₹)", "Symbol"] if c in df.columns],
+            index=0,
+            key="holdings_sort_by",
         )
+    with order_col:
+        sort_order = st.selectbox(
+            "Order",
+            options=["Descending", "Ascending"],
+            index=0,
+            key="holdings_sort_order",
+        )
+    with visible_col:
+        visible_columns = st.multiselect(
+            "Visible columns",
+            options=df.columns.tolist(),
+            default=df.columns.tolist(),
+            key="holdings_visible_columns",
+        )
+
+    sorted_df = df.copy()
+    if sort_by in sorted_df.columns:
+        ascending = sort_order == "Ascending"
+        if pd.api.types.is_numeric_dtype(sorted_df[sort_by]):
+            sorted_df = sorted_df.sort_values(sort_by, ascending=ascending, na_position="last")
+        else:
+            sorted_df["_sort_key"] = pd.to_numeric(sorted_df[sort_by], errors="coerce")
+            if sorted_df["_sort_key"].notna().any():
+                sorted_df = sorted_df.sort_values("_sort_key", ascending=ascending, na_position="last")
+            else:
+                sorted_df = sorted_df.sort_values(sort_by, ascending=ascending, na_position="last")
+            sorted_df = sorted_df.drop(columns=["_sort_key"], errors="ignore")
+
+    if not visible_columns:
+        st.warning("Select at least one column to display the holdings table.")
+        visible_columns = df.columns.tolist()
+    display_df = sorted_df[[c for c in visible_columns if c in sorted_df.columns]]
+
+    st.dataframe(
+        style_holdings_dataframe(display_df),
+        use_container_width=True,
+        hide_index=True,
+        height=460,
+    )
+    st.plotly_chart(build_portfolio_pie(df), use_container_width=True)
 
     # Optional: overlay dip signal for holdings that are in Nifty 50
     nifty_symbols = {sym.replace(".NS", "") for sym in NIFTY_50}
     held_nifty = [s for s in df["Symbol"].tolist() if s in nifty_symbols]
-    if held_nifty and "scan_results" in st.session_state:
-        scan_map = {r["Symbol"]: r for r in st.session_state["scan_results"]}
+    active_scan_results = (
+        st.session_state.get("scan_results_broad")
+        or st.session_state.get("scan_results_nifty50")
+        or st.session_state.get("scan_results")
+        or []
+    )
+    if held_nifty and active_scan_results:
+        scan_map = {r["Symbol"]: r for r in active_scan_results}
         overlap = []
         for sym in held_nifty:
             row = scan_map.get(sym)
@@ -2212,6 +4025,8 @@ def render_holdings_tab() -> None:
                             sym,
                             row.get("CMP (₹)"),
                         ),
+                        "Industry Sector": row.get("Industry Sector"),
+                        "Promoter Stake (%)": row.get("Promoter / Insider Stake (%)"),
                         "50-Day MA (₹)": row["50-Day MA (₹)"],
                         "vs MA (%)": row["vs MA (%)"],
                     }
@@ -2256,6 +4071,12 @@ def main() -> None:
         st.write(
             "Switch focus from the left panel. Recommended Stocks is the default view."
         )
+        st.selectbox(
+            "Signature style",
+            options=["Premium", "Minimal", "Neon"],
+            index=0,
+            key="signature_style_variant",
+        )
         st.caption("Theme inspired by Kite / Upstox dark terminals.")
         st.warning(
             "Not financial advice. API keys stay on your PC. "
@@ -2264,11 +4085,21 @@ def main() -> None:
 
     view = st.session_state.get("left_nav_focus", "📈 Recommended Stocks")
     active_mode = "RECOMMENDATION ENGINE" if view == "📈 Recommended Stocks" else "KITE HOLDINGS"
+    signature_variant_map = {
+        "Premium": "premium",
+        "Minimal": "minimal",
+        "Neon": "neon",
+    }
+    signature_variant = signature_variant_map.get(
+        st.session_state.get("signature_style_variant", "Premium"),
+        "premium",
+    )
     st.markdown(
         f"""
         <div class="bl-hero">
           <div class="bl-hero-left">
-            <div>
+            <div class="bl-signature-wrap bl-signature-style-{signature_variant}">
+              <div class="bl-signature">Prithvi's Zone</div>
               <div class="bl-hero-title">BharatMarket<span>Lens</span></div>
             </div>
           </div>
@@ -2319,7 +4150,7 @@ def main() -> None:
     st.markdown(
         f"""
         <div class="bl-footer">
-          BHARATMARKETLENS · YAHOO FINANCE + ZERODHA KITE CONNECT · {now}
+          BHARATMARKETLENS · YAHOO FINANCE + ZERODHA KITE CONNECT · PRITHVI'S ZONE · {now}
         </div>
         """,
         unsafe_allow_html=True,
