@@ -219,6 +219,33 @@ def _window_overlaps(window_text: Any, start_day: int, end_day: int) -> bool:
     return not (w_end < start_day or w_start > end_day)
 
 
+def _render_quick_glossary(pairs: list[tuple[str, str]]) -> None:
+    if not pairs:
+        return
+    chips: list[str] = []
+    for label, meaning in pairs:
+        safe_label = str(label).replace("<", "&lt;").replace(">", "&gt;")
+        safe_meaning = (
+            str(meaning).replace("&", "&amp;").replace('"', "&quot;").replace("'", "&#39;")
+        )
+        chips.append(
+            "<span "
+            f"title=\"{safe_meaning}\" "
+            "style=\"display:inline-block;padding:0.11rem 0.44rem;border:1px solid #33445f;"
+            "border-radius:999px;background:#121a26;color:#b5c2d6;font-size:0.72rem;"
+            "line-height:1.2;cursor:help;\">"
+            f"{safe_label}"
+            "</span>"
+        )
+    st.markdown(
+        "<div style=\"margin:-0.12rem 0 0.35rem 0;color:#9db0c8;font-size:0.74rem;\">"
+        "<span style=\"opacity:0.9;\">Quick glossary:</span> "
+        + " ".join(chips)
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+
+
 def _clean_text(value: Any) -> str | None:
     """Return stripped non-empty text, otherwise None."""
     text = str(value or "").strip()
@@ -2921,6 +2948,7 @@ def render_scanner_tab() -> None:
                 {
                     "Rank": rank,
                     "Symbol": row["Symbol"],
+                    "Company": row.get("Company"),
                     "CMP (₹)": row["CMP (₹)"],
                     "Day changed": _format_day_change(
                         row.get("Day changed"), row.get("Daily Change (%)")
@@ -2980,6 +3008,17 @@ def render_scanner_tab() -> None:
         table_header_col, met_summary_col = st.columns([2.4, 1.2], gap="small")
         with table_header_col:
             st.markdown("### Top 20 high-performing recommendations")
+            _render_quick_glossary(
+                [
+                    ("Conf", "Model confidence score on a 1-10 scale."),
+                    ("Met Exp", "Whether recent outcomes matched model expectation."),
+                    ("5m Mom %", "Five-minute intraday momentum."),
+                    ("15m Mom %", "Fifteen-minute momentum confirmation."),
+                    ("Buy Win", "Preferred buying window in next two weeks."),
+                    ("Sell Win", "Preferred selling window in next two weeks."),
+                    ("50DMA (₹)", "Fifty-day moving average reference price."),
+                ]
+            )
         with met_summary_col:
             with st.container(border=True):
                 st.caption("Expectations met overview")
@@ -2995,6 +3034,14 @@ def render_scanner_tab() -> None:
         if previous_top20:
             entrant_rows = [r for r in top20 if str(r.get("Symbol", "")) not in previous_top20]
             st.markdown("### New entrants today")
+            _render_quick_glossary(
+                [
+                    ("Day changed", "Current session directional move."),
+                    ("Promoter Stake (%)", "Insider/promoter ownership quality cue."),
+                    ("5m Mom %", "Immediate momentum pulse."),
+                    ("15m Mom %", "Short intraday momentum confirmation."),
+                ]
+            )
             if entrant_rows:
                 entrants_df = pd.DataFrame(
                     [
@@ -3031,6 +3078,15 @@ def render_scanner_tab() -> None:
         st.session_state[previous_top20_key] = current_top20_symbols
 
         st.markdown("### Swing candidate engine (3-10 days)")
+        _render_quick_glossary(
+            [
+                ("Card Score", "Composite quality score for trade-card ranking."),
+                ("Card Tag", "Human-readable setup strength bucket."),
+                ("RR to T1", "Risk-reward ratio from entry to Target 1."),
+                ("RR to T2", "Risk-reward ratio from entry to Target 2."),
+                ("Time Stop (days)", "Maximum hold days before reevaluation."),
+            ]
+        )
         swing_candidates = sorted(
             [
                 r
@@ -3051,6 +3107,7 @@ def render_scanner_tab() -> None:
                 [
                     {
                         "Symbol": r.get("Symbol"),
+                        "Company": r.get("Company"),
                         "Added on": r.get("_added_on", "NA"),
                         "Rec": r.get("Recommendation"),
                         "Swing Grade": r.get("Swing Grade"),
@@ -3103,6 +3160,14 @@ def render_scanner_tab() -> None:
         fav_now_header_col, fav_now_summary_col = st.columns([2.4, 1.2], gap="small")
         with fav_now_header_col:
             st.markdown("### Favourable right now")
+            _render_quick_glossary(
+                [
+                    ("Met Exp", "Whether latest outcomes matched model expectation."),
+                    ("Avg Vol 5D", "Average traded volume over last 5 sessions."),
+                    ("Buy/Sell Vol Ratio", "Buyer vs seller pressure indicator."),
+                    ("Sell Window (days)", "Preferred near-term exit window."),
+                ]
+            )
         with fav_now_summary_col:
             with st.container(border=True):
                 st.caption("Expectations met overview")
@@ -3112,6 +3177,7 @@ def render_scanner_tab() -> None:
                 [
                     {
                         "Symbol": r.get("Symbol"),
+                        "Company": r.get("Company"),
                         "CMP (₹)": r.get("CMP (₹)"),
                         "Recommendation": r.get("Recommendation"),
                         "Met Exp": r.get("Met Expectation Today"),
@@ -3131,7 +3197,6 @@ def render_scanner_tab() -> None:
                         "Avg Vol 5D": r.get("Avg Volume 5D"),
                         "Buy/Sell Vol Ratio": r.get("Buy/Sell Volume Ratio"),
                         "Sell Window (days)": r.get("Sell Window (next 2w, days)"),
-                        "Company": r.get("Company"),
                         "Reason": (r.get("Reason for Recommendation") or "")[:90],
                     }
                     for r in fav_now
@@ -3151,6 +3216,14 @@ def render_scanner_tab() -> None:
         fav_near_header_col, fav_near_summary_col = st.columns([2.4, 1.2], gap="small")
         with fav_near_header_col:
             st.markdown("### Favourable in near future")
+            _render_quick_glossary(
+                [
+                    ("Met Exp", "Expectation match quality from recent signals."),
+                    ("Avg Vol 5D", "Liquidity proxy across recent 5 days."),
+                    ("Buy/Sell Vol Ratio", "Current order-flow tilt."),
+                    ("Buy Window (days)", "Expected waiting period before better entry."),
+                ]
+            )
         with fav_near_summary_col:
             with st.container(border=True):
                 st.caption("Expectations met overview")
@@ -3160,6 +3233,7 @@ def render_scanner_tab() -> None:
                 [
                     {
                         "Symbol": r.get("Symbol"),
+                        "Company": r.get("Company"),
                         "CMP (₹)": r.get("CMP (₹)"),
                         "Recommendation": r.get("Recommendation"),
                         "Met Exp": r.get("Met Expectation Today"),
@@ -3179,7 +3253,6 @@ def render_scanner_tab() -> None:
                         "Avg Vol 5D": r.get("Avg Volume 5D"),
                         "Buy/Sell Vol Ratio": r.get("Buy/Sell Volume Ratio"),
                         "Buy Window (days)": r.get("Buy Window (next 2w, days)"),
-                        "Company": r.get("Company"),
                         "Reason": (r.get("Reason for Recommendation") or "")[:90],
                     }
                     for r in fav_near
@@ -3194,6 +3267,13 @@ def render_scanner_tab() -> None:
             st.info("No near-future watch candidates under current filter.")
 
         st.markdown("### Top 6 bullish buy candidates (5-10 days)")
+        _render_quick_glossary(
+            [
+                ("Target 2 Upside (%)", "Estimated upside from CMP to Target 2."),
+                ("Sell Window (days)", "Expected timeframe to consider exit."),
+                ("Bullish Share (%)", "Relative weight of each stock in bullish basket."),
+            ]
+        )
         strict_bullish_rows: list[dict[str, Any]] = []
         fallback_bullish_rows: list[dict[str, Any]] = []
         for row in filtered:
@@ -3319,6 +3399,7 @@ def render_scanner_tab() -> None:
                         selected_bullish_df[
                             [
                                 "Symbol",
+                                "Company",
                                 "Industry Sector",
                                 "Recommendation",
                                 "Confidence",
@@ -3364,6 +3445,13 @@ def render_scanner_tab() -> None:
                 remaining_movers_cols = [c for c in movers_df.columns if c not in existing_movers_cols]
                 movers_df = movers_df[existing_movers_cols + remaining_movers_cols]
                 st.markdown("### Today's broad-market gainers")
+                _render_quick_glossary(
+                    [
+                        ("Current Volume", "Live participation/interest in the move."),
+                        ("Minimum Holding Period (days)", "Minimum suggested hold duration."),
+                        ("Increased % since last 5 days", "Five-session price appreciation."),
+                    ]
+                )
                 st.dataframe(
                     style_met_expectation_dataframe(movers_df),
                     use_container_width=True,
@@ -3498,6 +3586,14 @@ def render_scanner_tab() -> None:
             st.info("Trade card will appear after swing candidates are available.")
 
         st.markdown("### Position sizing and trade journal")
+        _render_quick_glossary(
+            [
+                ("Status", "OPEN means active, CLOSED means exited."),
+                ("Live/Exit", "Live mark for open trades, exit price for closed."),
+                ("P/L (₹)", "Absolute profit or loss in rupees."),
+                ("P/L (%)", "Percentage return for trade quality review."),
+            ]
+        )
         if "paper_trade_journal_rows" not in st.session_state:
             st.session_state["paper_trade_journal_rows"] = _load_trade_journal()
         journal_rows: list[dict[str, Any]] = list(st.session_state.get("paper_trade_journal_rows", []))
@@ -3627,6 +3723,7 @@ def render_scanner_tab() -> None:
                         "Opened": row.get("opened_on"),
                         "Closed": row.get("closed_on") or "-",
                         "Symbol": symbol,
+                        "Company": row.get("company") or "NA",
                         "Industry Sector": row.get("industry_sector") or "NA",
                         "Qty": qty,
                         "Entry": entry,
@@ -3730,6 +3827,213 @@ def render_scanner_tab() -> None:
                         st.markdown(f"- [{title}]({link}) — {publisher}")
                     else:
                         st.markdown(f"- {title} — {publisher}")
+
+        st.markdown("## Synopsis")
+        st.caption(
+            "Reference guide for every dashboard column shown in this Recommendations page. "
+            "Use this to quickly understand why each field matters."
+        )
+
+        synopsis_sections: list[tuple[str, list[tuple[str, str]]]] = [
+            (
+                "Top 20 high-performing recommendations",
+                [
+                    ("Rank", "Priority order based on model score and confidence."),
+                    ("Symbol", "Exchange ticker used for tracking and order placement."),
+                    ("Company", "Full company name for quick recognition beside ticker."),
+                    ("CMP (₹)", "Current market price; base for entry/exit and risk checks."),
+                    ("Day changed", "Intraday move marker to read immediate strength or weakness."),
+                    ("Since added", "Performance since this stock entered tracked recommendations."),
+                    ("Added on", "Date when recommendation first appeared in the scan list."),
+                    ("Industry Sector", "Business segment; helps diversify and avoid concentration."),
+                    ("52W High (₹)", "One-year peak price used to judge room to recover."),
+                    ("Exp MA 2W (₹)", "Projected 2-week moving-average reference for near trend path."),
+                    ("Proposed Entry (₹)", "Suggested buy zone anchor used by position sizing."),
+                    ("Proposed Exit (₹)", "Suggested profit-taking level, usually with expected gain."),
+                    ("Promoter Stake (%)", "Insider ownership proxy for alignment and ownership quality."),
+                    ("Rec", "Action signal: BUY, BUY ON DIP, or WATCH."),
+                    ("Met Exp", "Whether recent outcomes matched model expectation (YES/MIXED/NO)."),
+                    ("5m Mom %", "Very short-term momentum; useful for timing entries."),
+                    ("15m Mom %", "Short-term momentum confirmation to reduce weak setups."),
+                    ("Buy Win", "Preferred buying window over the next two weeks (days)."),
+                    ("Sell Win", "Preferred selling/booking window over the next two weeks (days)."),
+                    ("Days to Result", "Days until earnings/results; event-risk visibility."),
+                    ("Conf", "Model confidence score on a 1-10 scale."),
+                    ("50DMA (₹)", "50-day average used to evaluate mean-reversion/trend context."),
+                    ("Sentiment", "Headline/news tone (Positive/Neutral/Negative)."),
+                    ("Source", "Data/news providers used for this row."),
+                ],
+            ),
+            (
+                "New entrants today",
+                [
+                    ("Symbol", "Ticker newly entering Top 20 compared with prior run."),
+                    ("Company", "Full company name for quick recognition."),
+                    ("Recommendation", "Current action bias for the entrant."),
+                    ("Confidence", "Signal reliability proxy used for prioritization."),
+                    ("CMP (₹)", "Latest tradable price snapshot."),
+                    ("Industry Sector", "Sector context for thematic comparison."),
+                    ("Day changed", "Current day momentum snapshot."),
+                    ("Promoter Stake (%)", "Ownership quality check for new ideas."),
+                    ("Proposed Entry (₹)", "Suggested accumulation price level."),
+                    ("Proposed Exit (₹)", "Planned exit with expected payoff context."),
+                    ("Added on", "Date this symbol first got picked by engine."),
+                    ("5m Mom %", "Immediate momentum pulse."),
+                    ("15m Mom %", "Broader intraday momentum confirmation."),
+                ],
+            ),
+            (
+                "Swing candidate engine (3-10 days)",
+                [
+                    ("Symbol", "Candidate ticker for swing setup."),
+                    ("Company", "Full company name for fast identification."),
+                    ("Added on", "When the setup entered recommendation flow."),
+                    ("Rec", "Signal bias driving the swing idea."),
+                    ("Swing Grade", "Precomputed quality band for swing potential."),
+                    ("Card Score", "Composite trade-card score for setup quality."),
+                    ("Card Tag", "Readable label for aggressiveness/quality bucket."),
+                    ("Confidence", "Model trust score for this setup."),
+                    ("CMP (₹)", "Current price used for entry calibration."),
+                    ("Industry Sector", "Sector exposure context."),
+                    ("Proposed Entry (₹)", "Preferred entry level."),
+                    ("Proposed Exit (₹)", "Preferred planned exit and gain context."),
+                    ("Entry Zone (₹)", "Acceptable entry range instead of single point."),
+                    ("Stop Loss (₹)", "Risk cutoff price; core risk-management field."),
+                    ("Target 1 (₹)", "First profit objective for partial booking."),
+                    ("Target 2 (₹)", "Second/extended profit objective."),
+                    ("Time Stop (days)", "Max hold duration before reevaluation/exit."),
+                    ("Promoter Stake (%)", "Ownership conviction proxy."),
+                    ("RR to T1", "Risk-reward ratio from entry to Target 1."),
+                    ("RR to T2", "Risk-reward ratio from entry to Target 2."),
+                    ("5m Mom %", "Very short momentum for execution timing."),
+                    ("15m Mom %", "Short momentum trend confirmation."),
+                ],
+            ),
+            (
+                "Favourable right now",
+                [
+                    ("Symbol", "Ticker currently flagged as actionable now."),
+                    ("Company", "Full company name for quick readability."),
+                    ("CMP (₹)", "Current market price."),
+                    ("Recommendation", "Action type currently advised."),
+                    ("Met Exp", "Recent expectation match indicator."),
+                    ("Day changed", "Current session move."),
+                    ("Since added", "Return since recommendation inclusion."),
+                    ("Added on", "Original recommendation start date."),
+                    ("Industry Sector", "Sector category."),
+                    ("Confidence", "Model confidence level."),
+                    ("Promoter Stake (%)", "Insider/promoter ownership filter."),
+                    ("Proposed Entry (₹)", "Suggested entry level."),
+                    ("Proposed Exit (₹)", "Suggested exit level with gain context."),
+                    ("Avg Vol 5D", "Average 5-day traded volume; liquidity check."),
+                    ("Buy/Sell Vol Ratio", "Buyer vs seller pressure indicator."),
+                    ("Sell Window (days)", "Expected timeline to consider booking exits."),
+                    ("Reason", "Condensed rationale behind recommendation."),
+                ],
+            ),
+            (
+                "Favourable in near future",
+                [
+                    ("Symbol", "Ticker likely to become actionable soon."),
+                    ("Company", "Full company name for quick readability."),
+                    ("CMP (₹)", "Current market price."),
+                    ("Recommendation", "Current watch stance."),
+                    ("Met Exp", "Recent expectation match score."),
+                    ("Day changed", "Current day move."),
+                    ("Since added", "Performance since tracked."),
+                    ("Added on", "When recommendation was first logged."),
+                    ("Industry Sector", "Sector context."),
+                    ("Confidence", "Signal confidence score."),
+                    ("Promoter Stake (%)", "Insider ownership robustness cue."),
+                    ("Proposed Entry (₹)", "Planned entry reference."),
+                    ("Proposed Exit (₹)", "Planned exit reference."),
+                    ("Avg Vol 5D", "Liquidity proxy for trade feasibility."),
+                    ("Buy/Sell Vol Ratio", "Net order-flow tilt."),
+                    ("Buy Window (days)", "Expected waiting window before favorable entry."),
+                    ("Reason", "Short text rationale for watchlist inclusion."),
+                ],
+            ),
+            (
+                "Top 6 bullish buy candidates (5-10 days)",
+                [
+                    ("Symbol", "Ticker selected by strict bullish filter."),
+                    ("Company", "Full company name for quick readability."),
+                    ("Industry Sector", "Sector diversification context."),
+                    ("Recommendation", "BUY bias source."),
+                    ("Confidence", "Model confidence score."),
+                    ("CMP (₹)", "Current market price."),
+                    ("Proposed Entry (₹)", "Suggested accumulation level."),
+                    ("Proposed Exit (₹)", "Suggested profit-booking level."),
+                    ("Promoter Stake (%)", "Promoter commitment quality measure."),
+                    ("Target 2 Upside (%)", "Estimated upside to second target."),
+                    ("Sell Window (days)", "Expected optimal exit period."),
+                    ("Bullish Share (%)", "Weight share of this pick in bullish basket."),
+                ],
+            ),
+            (
+                "Today's broad-market gainers",
+                [
+                    ("Symbol", "Ticker among current broad-market gainers."),
+                    ("Company", "Company name for readability."),
+                    ("CMP (₹)", "Current market price."),
+                    ("Industry Sector", "Sector grouping for rotation analysis."),
+                    ("Promoter Stake (%)", "Ownership quality marker."),
+                    ("Current Volume", "Current traded volume for participation strength."),
+                    ("Entry Price (₹)", "Suggested entry anchor."),
+                    ("Proposed Exit (₹)", "Suggested exit anchor."),
+                    ("Minimum Holding Period (days)", "Minimum suggested hold duration."),
+                    ("Increased % since last 5 days", "5-day appreciation magnitude."),
+                    ("Daily Change (%)", "Current day percentage change."),
+                ],
+            ),
+            (
+                "Position sizing and trade journal",
+                [
+                    ("Status", "OPEN or CLOSED trade state."),
+                    ("Opened", "Trade entry date."),
+                    ("Closed", "Trade exit date if closed."),
+                    ("Symbol", "Ticker traded in paper journal."),
+                    ("Company", "Company name tied to the tracked trade."),
+                    ("Industry Sector", "Sector tag for exposure review."),
+                    ("Qty", "Shares/units taken in the position."),
+                    ("Entry", "Executed entry price."),
+                    ("Live/Exit", "Current mark price (open) or booked exit price (closed)."),
+                    ("Stop", "Risk-protection stop-loss level."),
+                    ("T1", "First target level."),
+                    ("T2", "Second target level."),
+                    ("P/L (₹)", "Absolute profit/loss in rupees."),
+                    ("P/L (%)", "Percentage return on the trade."),
+                    ("Notes", "Trader notes/context for post-trade review."),
+                ],
+            ),
+            (
+                "Your Nifty 50 holdings vs dip scanner",
+                [
+                    ("Symbol", "Held Nifty 50 stock symbol."),
+                    ("Company", "Full company name from scanner context."),
+                    ("Signal", "Scanner output signal for held symbol."),
+                    ("Confidence", "Signal confidence score."),
+                    ("Price (₹)", "Current evaluated price."),
+                    ("Day changed", "Session move snapshot."),
+                    ("Since added", "Performance since scanner started tracking."),
+                    ("Industry Sector", "Sector context for overlap holdings."),
+                    ("Promoter Stake (%)", "Ownership strength indicator."),
+                    ("50-Day MA (₹)", "Baseline trend level from moving average."),
+                    ("vs MA (%)", "Percent distance from 50-day moving average."),
+                ],
+            ),
+        ]
+
+        for section_title, section_rows in synopsis_sections:
+            with st.expander(section_title, expanded=False):
+                st.markdown(
+                    "\n".join(
+                        [
+                            f"- **{column_name}**: {column_meaning}"
+                            for column_name, column_meaning in section_rows
+                        ]
+                    )
+                )
 
 
 def _complete_zerodha_login(api_key: str, api_secret: str, request_token: str) -> bool:
@@ -4024,6 +4328,7 @@ def render_holdings_tab() -> None:
                 overlap.append(
                     {
                         "Symbol": sym,
+                        "Company": row.get("Company") or "NA",
                         "Signal": row["Signal"],
                         "Confidence": row["Confidence (1-10)"],
                         "Price (₹)": row["Price (₹)"],
@@ -4044,6 +4349,14 @@ def render_holdings_tab() -> None:
                 )
         if overlap:
             st.markdown("### Your Nifty 50 holdings vs dip scanner")
+            _render_quick_glossary(
+                [
+                    ("Signal", "Scanner action bias for held symbol."),
+                    ("Confidence", "Strength score of the scanner signal."),
+                    ("50-Day MA (₹)", "Trend baseline from medium-term average."),
+                    ("vs MA (%)", "Percent distance from the 50-day average."),
+                ]
+            )
             overlap_df = pd.DataFrame(overlap).sort_values(
                 "Confidence", ascending=False, na_position="last"
             )
